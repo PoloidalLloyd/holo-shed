@@ -1,12 +1,4 @@
 """
-Hermes-3 1D GUI (PyQt + embedded Matplotlib).
-
-This is a refactor of `hermes3_gui.py`, which implemented a "GUI" using
-`matplotlib.widgets` (Buttons, Sliders, TextBox) inside a Matplotlib window.
-
-This version uses Qt widgets for UI (path box, buttons, variable list, slider)
-and embeds Matplotlib as a plotting canvas.
-
 Run:
 
 ```bash
@@ -99,12 +91,26 @@ class _LoadedCase:
 
 def _ensure_sdtools_on_path():
     """
-    Make a best-effort attempt to ensure `analysis/sdtools` is importable.
+    Make a best-effort attempt to ensure sdtools is importable.
 
-    This script lives in: analysis/notebooks/hermes-3/general_functions/
-    sdtools lives in:        analysis/sdtools/
+    Preferred (self-contained) layout:
+      - repo_root/external/sdtools  (git submodule)
+
+    Legacy layout:
+      - repo_root/analysis/sdtools
     """
     here = Path(__file__).resolve()
+
+    # Preferred: sdtools is vendored as a submodule under this repo.
+    for parent in [here.parent, *here.parents]:
+        sdtools_dir = parent / "external" / "sdtools"
+        if sdtools_dir.exists():
+            sp = str(sdtools_dir)
+            if sp not in sys.path:
+                sys.path.insert(0, sp)
+            return
+
+    # Legacy: some repos keep sdtools under analysis/sdtools.
     for parent in [here.parent, *here.parents]:
         sdtools_dir = parent / "analysis" / "sdtools"
         if sdtools_dir.exists():
@@ -237,19 +243,6 @@ def _apply_qt_light_theme(app: "QApplication") -> None:
 
 
 class Hermes3QtMainWindow(QMainWindow):
-    """
-    Qt GUI embedding Matplotlib for Hermes-3 1D profiles.
-
-    Feature parity goals with the Matplotlib-widgets GUI:
-    - Load/append datasets (multiple cases)
-    - Searchable, checkable variable list; preserve selection order
-    - Time slider (index), with readout (time coordinate if available)
-    - Per-variable y-scale (linear/log/symlog) and y-limits mode (auto/final/global)
-
-    Differences:
-    - Per-variable scale/ylim controls are exposed via a right-click menu on the variable list
-      and shown inline in the variable list item text (instead of Matplotlib overlay buttons).
-    """
 
     def __init__(self, *, initial_case_path: Optional[str], spatial_dim: Optional[str]):
         super().__init__()
@@ -261,8 +254,14 @@ class Hermes3QtMainWindow(QMainWindow):
             raise ImportError(
                 "Could not import `hermes3.load.Load`.\n"
                 "Fix by either:\n"
-                "- setting PYTHONPATH to include `.../analysis/sdtools`, or\n"
-                "- running this script from within the repo where `analysis/sdtools` exists.\n"
+                "- initialising the bundled sdtools submodule:\n"
+                "    git submodule update --init --recursive\n"
+                "- OR setting PYTHONPATH to include a local sdtools checkout (repo root), e.g.\n"
+                "    export PYTHONPATH=/path/to/sdtools:$PYTHONPATH\n"
+                "\n"
+                "Expected locations:\n"
+                "- ./external/sdtools   (recommended)\n"
+                "- ./analysis/sdtools   (legacy)\n"
                 f"Original error: {e}"
             ) from e
 
@@ -500,10 +499,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: #b00020;" if is_error else "color: #333;")
 
     def _on_plot_tab_changed(self, index: int) -> None:
-        """
-        Keep the left-side controls tab aligned with the active plot tab,
-        and redraw whichever plot is being shown.
-        """
+ 
         try:
             # Sync the controls tab with the plot tab (0=Profiles, 1=Time history)
             self.controls_tabs.setCurrentIndex(int(index))
@@ -514,12 +510,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.request_time_history_redraw()
 
     def request_time_history_redraw(self) -> None:
-        """
-        Debounced request to redraw the time-history plot.
 
-        Matplotlib can be slow when rebuilding many subplots; debouncing avoids
-        multiple redraws while the user is still adjusting controls.
-        """
         try:
             self._hist_redraw_timer.start(120)
         except Exception:
@@ -757,10 +748,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self._overlay_axes_by_var = {}
 
     def _sync_overlay_buttons(self, vars_to_plot: List[str], axes: List["object"]) -> None:
-        """
-        Ensure we have one pair of overlay buttons per variable being plotted,
-        and keep a mapping from var -> axes for positioning.
-        """
+
         # Remove buttons for vars no longer plotted
         keep = set(vars_to_plot)
         for v in list(self._overlay_buttons.keys()):
@@ -791,14 +779,11 @@ class Hermes3QtMainWindow(QMainWindow):
             ylim_btn.setText(self._ylim_mode_label(self._ylim_mode_by_var.get(v, "auto")))
             yscale_btn.setText(self._yscale_label(self._yscale_by_var.get(v, "linear")))
 
-            # Make small and unobtrusive
             ylim_btn.setFixedHeight(self._overlay_btn_h)
             yscale_btn.setFixedHeight(self._overlay_btn_h)
             ylim_btn.setFixedWidth(self._overlay_btn_w_ylim)
             yscale_btn.setFixedWidth(self._overlay_btn_w_yscale)
 
-            # Slightly transparent background so data remains visible.
-            # (Qt style sheets are safe; if ignored, it's fine.)
             try:
                 style = (
                     "QPushButton {"
