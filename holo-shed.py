@@ -143,6 +143,35 @@ def _guard_replace_1d_profile_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarr
     return xx, yy
 
 
+def _downsample_xy(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if max_points is None or max_points <= 0:
+        return x, y
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
+        return x, y
+    n = int(x.size)
+    if n <= int(max_points):
+        return x, y
+    stride = int(np.ceil(n / float(max_points)))
+    return x[::stride], y[::stride]
+
+
+def _parse_optional_float(text: str) -> Optional[float]:
+    """
+    Parse a float from a text box. Empty/'auto' -> None.
+    """
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s or s.lower() == "auto":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
 def _format_case_label(case_path: str) -> str:
     p = Path(case_path).expanduser().resolve()
     return p.name or str(p)
@@ -585,6 +614,12 @@ class Hermes3QtMainWindow(QMainWindow):
         self._overlay_buttons: Dict[str, Tuple["QPushButton", "QPushButton"]] = {}
         # var -> matplotlib Axes (for positioning)
         self._overlay_axes_by_var: Dict[str, "object"] = {}
+        # 2D poloidal overlays
+        self._overlay_buttons_pol: Dict[str, Tuple["QPushButton", "QPushButton"]] = {}
+        self._overlay_axes_by_var_pol: Dict[str, "object"] = {}
+        # 2D radial overlays
+        self._overlay_buttons_rad: Dict[str, Tuple["QPushButton", "QPushButton"]] = {}
+        self._overlay_axes_by_var_rad: Dict[str, "object"] = {}
         # Geometry constants (pixels, in canvas coordinates)
         self._overlay_btn_h = 22
         self._overlay_btn_w_yscale = 56
@@ -594,6 +629,18 @@ class Hermes3QtMainWindow(QMainWindow):
         # Keep overlay buttons positioned correctly on draw + resize.
         self.canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons())
         self.canvas.installEventFilter(self)
+        # 2D canvases (created in _build_ui) also use overlay buttons.
+        # These may not exist in early init, so guard with getattr.
+        try:
+            self.pol_canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons_pol())
+            self.pol_canvas.installEventFilter(self)
+        except Exception:
+            pass
+        try:
+            self.rad_canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons_rad())
+            self.rad_canvas.installEventFilter(self)
+        except Exception:
+            pass
 
         # Time-history performance helpers:
         # - debounce redraws (avoid redrawing many times while user drags/scrolls)
@@ -604,6 +651,14 @@ class Hermes3QtMainWindow(QMainWindow):
         self._hist_cache: Dict[tuple, tuple] = {}
         self._hist_max_points = 2000  # downsample long traces for responsiveness
         self._mon_cache: Dict[tuple, tuple] = {}
+        self._pol_cache: Dict[tuple, object] = {}
+        self._rad_cache: Dict[tuple, object] = {}
+        self._profile_max_points = 2500
+
+        # General redraw debounce (profiles + 2D tabs)
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.timeout.connect(self._do_redraw)
 
         if initial_case_path:
             self.path_edit.setText(str(initial_case_path))
@@ -797,6 +852,21 @@ class Hermes3QtMainWindow(QMainWindow):
         self.poly_grid_only_check = QCheckBox("grid only (no colormap)")
         self.poly_grid_only_check.setChecked(False)
         poly_ctrl_layout.addWidget(self.poly_grid_only_check)
+
+        self.poly_log_check = QCheckBox("log scale")
+        self.poly_log_check.setChecked(False)
+        poly_ctrl_layout.addWidget(self.poly_log_check)
+
+        clim_row = QHBoxLayout()
+        clim_row.addWidget(QLabel("cbar min"))
+        self.poly_vmin_edit = QLineEdit()
+        self.poly_vmin_edit.setPlaceholderText("auto")
+        clim_row.addWidget(self.poly_vmin_edit, 1)
+        clim_row.addWidget(QLabel("max"))
+        self.poly_vmax_edit = QLineEdit()
+        self.poly_vmax_edit.setPlaceholderText("auto")
+        clim_row.addWidget(self.poly_vmax_edit, 1)
+        poly_ctrl_layout.addLayout(clim_row)
         poly_ctrl_layout.addStretch(1)
 
         self._mon_ctrl_tab = QWidget()
@@ -920,15 +990,18 @@ class Hermes3QtMainWindow(QMainWindow):
         self.vars_list.itemChanged.connect(self._on_var_item_changed)
         self.vars_list.itemDoubleClicked.connect(self._on_var_item_double_clicked)
         self.vars_list.customContextMenuRequested.connect(self._on_var_list_context_menu)
-        self.time_slider.valueChanged.connect(lambda _v: self.redraw())
-        self.time_slider_2d.valueChanged.connect(lambda _v: self.redraw())
+        self.time_slider.valueChanged.connect(lambda _v: self.request_redraw())
+        self.time_slider_2d.valueChanged.connect(lambda _v: self.request_redraw())
         self.time_slider_2d.valueChanged.connect(lambda _v: self._update_time_readout())
-        self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.redraw())
-        self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.redraw())
-        self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.redraw())
-        self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.redraw())
-        self.poly_grid_only_check.toggled.connect(lambda _v: self.redraw())
-        self.guard_replace_check.toggled.connect(lambda _v: self.redraw())
+        self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
+        self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
+        self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
+        self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
+        self.poly_grid_only_check.toggled.connect(lambda _v: self.request_redraw())
+        self.poly_log_check.toggled.connect(lambda _v: self.request_redraw())
+        self.poly_vmin_edit.editingFinished.connect(lambda: self.request_redraw())
+        self.poly_vmax_edit.editingFinished.connect(lambda: self.request_redraw())
+        self.guard_replace_check.toggled.connect(lambda _v: self.request_redraw())
         self.guard_replace_check.toggled.connect(lambda _v: self.request_time_history_redraw())
         self.hist_upstream_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
         self.hist_target_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
@@ -1043,10 +1116,10 @@ class Hermes3QtMainWindow(QMainWindow):
         except Exception:
             pass
         if self._mode_is_2d:
-            self._redraw_2d_current_tab()
+            self.request_redraw()
         else:
             # Redraw both (cheap enough and keeps state consistent)
-            self.redraw()
+            self.request_redraw()
             self.request_time_history_redraw()
 
     def request_time_history_redraw(self) -> None:
@@ -1061,6 +1134,22 @@ class Hermes3QtMainWindow(QMainWindow):
         except Exception:
             # Fallback: redraw immediately
             self._do_redraw_time_history()
+
+    def request_redraw(self) -> None:
+        """
+        Debounced redraw for the currently active plot tab.
+        """
+        try:
+            self._redraw_timer.start(80)
+        except Exception:
+            self._do_redraw()
+
+    def _do_redraw(self) -> None:
+        try:
+            self.redraw()
+        except Exception:
+            # avoid crashing the UI loop on unexpected plot errors
+            pass
 
     def _update_datasets_list(self) -> None:
         if not self.cases:
@@ -1135,7 +1224,7 @@ class Hermes3QtMainWindow(QMainWindow):
 
         # Update display text (so mode info stays visible)
         item.setText(self._item_text_for_var(name))
-        self.redraw()
+        self.request_redraw()
         self.request_time_history_redraw()
 
     def _on_var_item_double_clicked(self, item: "QListWidgetItem") -> None:
@@ -1160,7 +1249,7 @@ class Hermes3QtMainWindow(QMainWindow):
                     it.setCheckState(_qt_unchecked())
         finally:
             self.vars_list.blockSignals(False)
-        self.redraw()
+        self.request_redraw()
         self.request_time_history_redraw()
 
     def _cycle_yscale(self, current: str) -> str:
@@ -1230,13 +1319,13 @@ class Hermes3QtMainWindow(QMainWindow):
             cur = self._yscale_by_var.get(name, "linear")
             self._yscale_by_var[name] = self._cycle_yscale(cur)
             self._refresh_var_item(name)
-            self.redraw()
+            self.request_redraw()
 
         def _do_cycle_ylim():
             cur = self._ylim_mode_by_var.get(name, "auto")
             self._ylim_mode_by_var[name] = self._cycle_ylim_mode(cur)
             self._refresh_var_item(name)
-            self.redraw()
+            self.request_redraw()
 
         act_cycle_y.triggered.connect(_do_cycle_y)
         act_cycle_ylim.triggered.connect(_do_cycle_ylim)
@@ -1257,13 +1346,13 @@ class Hermes3QtMainWindow(QMainWindow):
         self._yscale_by_var[varname] = mode
         self._refresh_var_item(varname)
         self._refresh_overlay_button_labels(varname)
-        self.redraw()
+        self.request_redraw()
 
     def _set_var_ylim_mode(self, varname: str, mode: str) -> None:
         self._ylim_mode_by_var[varname] = mode
         self._refresh_var_item(varname)
         self._refresh_overlay_button_labels(varname)
-        self.redraw()
+        self.request_redraw()
 
     # ---------- Overlay buttons on plots (Option B) ----------
     def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
@@ -1276,6 +1365,14 @@ class Hermes3QtMainWindow(QMainWindow):
                 # PyQt6/PySide6 both expose QEvent.Type.Resize; keep a fallback just in case.
                 if et == QEvent.Type.Resize or et == getattr(QEvent, "Resize", None):
                     self._position_overlay_buttons()
+            if obj is getattr(self, "pol_canvas", None):
+                et = event.type()
+                if et == QEvent.Type.Resize or et == getattr(QEvent, "Resize", None):
+                    self._position_overlay_buttons_pol()
+            if obj is getattr(self, "rad_canvas", None):
+                et = event.type()
+                if et == QEvent.Type.Resize or et == getattr(QEvent, "Resize", None):
+                    self._position_overlay_buttons_rad()
         except Exception:
             pass
         return super().eventFilter(obj, event)
@@ -1291,6 +1388,30 @@ class Hermes3QtMainWindow(QMainWindow):
                 pass
         self._overlay_buttons = {}
         self._overlay_axes_by_var = {}
+
+    def _clear_overlay_buttons_pol(self) -> None:
+        for ylim_btn, yscale_btn in list(self._overlay_buttons_pol.values()):
+            try:
+                ylim_btn.hide()
+                yscale_btn.hide()
+                ylim_btn.deleteLater()
+                yscale_btn.deleteLater()
+            except Exception:
+                pass
+        self._overlay_buttons_pol = {}
+        self._overlay_axes_by_var_pol = {}
+
+    def _clear_overlay_buttons_rad(self) -> None:
+        for ylim_btn, yscale_btn in list(self._overlay_buttons_rad.values()):
+            try:
+                ylim_btn.hide()
+                yscale_btn.hide()
+                ylim_btn.deleteLater()
+                yscale_btn.deleteLater()
+            except Exception:
+                pass
+        self._overlay_buttons_rad = {}
+        self._overlay_axes_by_var_rad = {}
 
     def _sync_overlay_buttons(self, vars_to_plot: List[str], axes: List["object"]) -> None:
 
@@ -1360,26 +1481,27 @@ class Hermes3QtMainWindow(QMainWindow):
         self._position_overlay_buttons()
 
     def _refresh_overlay_button_labels(self, varname: str) -> None:
-        pair = self._overlay_buttons.get(varname)
-        if not pair:
-            return
-        ylim_btn, yscale_btn = pair
-        ylim_btn.setText(self._ylim_mode_label(self._ylim_mode_by_var.get(varname, "auto")))
-        yscale_btn.setText(self._yscale_label(self._yscale_by_var.get(varname, "linear")))
+        for d in (self._overlay_buttons, self._overlay_buttons_pol, self._overlay_buttons_rad):
+            pair = d.get(varname)
+            if not pair:
+                continue
+            ylim_btn, yscale_btn = pair
+            ylim_btn.setText(self._ylim_mode_label(self._ylim_mode_by_var.get(varname, "auto")))
+            yscale_btn.setText(self._yscale_label(self._yscale_by_var.get(varname, "linear")))
 
     def _on_overlay_yscale_clicked(self, varname: str) -> None:
         cur = self._yscale_by_var.get(varname, "linear")
         self._yscale_by_var[varname] = self._cycle_yscale(cur)
         self._refresh_var_item(varname)
         self._refresh_overlay_button_labels(varname)
-        self.redraw()
+        self.request_redraw()
 
     def _on_overlay_ylim_clicked(self, varname: str) -> None:
         cur = self._ylim_mode_by_var.get(varname, "auto")
         self._ylim_mode_by_var[varname] = self._cycle_ylim_mode(cur)
         self._refresh_var_item(varname)
         self._refresh_overlay_button_labels(varname)
-        self.redraw()
+        self.request_redraw()
 
     def _position_overlay_buttons(self) -> None:
         """
@@ -1434,6 +1556,155 @@ class Hermes3QtMainWindow(QMainWindow):
                 yscale_btn.raise_()
             except Exception:
                 pass
+
+    def _position_overlay_buttons_pol(self) -> None:
+        return self._position_overlay_buttons_for_canvas(
+            canvas=getattr(self, "pol_canvas", None),
+            overlay_buttons=self._overlay_buttons_pol,
+            overlay_axes_by_var=self._overlay_axes_by_var_pol,
+        )
+
+    def _position_overlay_buttons_rad(self) -> None:
+        return self._position_overlay_buttons_for_canvas(
+            canvas=getattr(self, "rad_canvas", None),
+            overlay_buttons=self._overlay_buttons_rad,
+            overlay_axes_by_var=self._overlay_axes_by_var_rad,
+        )
+
+    def _position_overlay_buttons_for_canvas(self, *, canvas, overlay_buttons, overlay_axes_by_var) -> None:
+        if canvas is None:
+            return
+        if not overlay_buttons or not overlay_axes_by_var:
+            return
+        try:
+            w, h = canvas.get_width_height()
+        except Exception:
+            return
+        if not w or not h:
+            return
+
+        pad = int(self._overlay_pad)
+        bh = int(self._overlay_btn_h)
+        bw_y = int(self._overlay_btn_w_yscale)
+        bw_l = int(self._overlay_btn_w_ylim)
+
+        for v, (ylim_btn, yscale_btn) in list(overlay_buttons.items()):
+            ax = overlay_axes_by_var.get(v)
+            if ax is None:
+                try:
+                    ylim_btn.hide()
+                    yscale_btn.hide()
+                except Exception:
+                    pass
+                continue
+            try:
+                pos = ax.get_position()
+                x_right = int(pos.x1 * w)
+                y_top = int((1.0 - pos.y1) * h)
+            except Exception:
+                continue
+
+            y = max(0, y_top + pad)
+            x_yscale = max(0, x_right - bw_y - pad)
+            x_ylim = max(0, x_yscale - bw_l - pad)
+
+            try:
+                yscale_btn.setGeometry(x_yscale, y, bw_y, bh)
+                ylim_btn.setGeometry(x_ylim, y, bw_l, bh)
+                ylim_btn.show()
+                yscale_btn.show()
+                ylim_btn.raise_()
+                yscale_btn.raise_()
+            except Exception:
+                pass
+
+    def _sync_overlay_buttons_pol(self, vars_to_plot: List[str], axes: List["object"]) -> None:
+        self._sync_overlay_buttons_for_canvas(
+            canvas=getattr(self, "pol_canvas", None),
+            vars_to_plot=vars_to_plot,
+            axes=axes,
+            overlay_buttons=self._overlay_buttons_pol,
+            overlay_axes_by_var=self._overlay_axes_by_var_pol,
+        )
+        self._position_overlay_buttons_pol()
+
+    def _sync_overlay_buttons_rad(self, vars_to_plot: List[str], axes: List["object"]) -> None:
+        self._sync_overlay_buttons_for_canvas(
+            canvas=getattr(self, "rad_canvas", None),
+            vars_to_plot=vars_to_plot,
+            axes=axes,
+            overlay_buttons=self._overlay_buttons_rad,
+            overlay_axes_by_var=self._overlay_axes_by_var_rad,
+        )
+        self._position_overlay_buttons_rad()
+
+    def _sync_overlay_buttons_for_canvas(
+        self,
+        *,
+        canvas,
+        vars_to_plot: List[str],
+        axes: List["object"],
+        overlay_buttons: Dict[str, Tuple["QPushButton", "QPushButton"]],
+        overlay_axes_by_var: Dict[str, "object"],
+    ) -> None:
+        if canvas is None:
+            return
+        # Remove buttons for vars no longer plotted
+        keep = set(vars_to_plot)
+        for v in list(overlay_buttons.keys()):
+            if v not in keep:
+                try:
+                    ylim_btn, yscale_btn = overlay_buttons.pop(v)
+                    ylim_btn.hide()
+                    yscale_btn.hide()
+                    ylim_btn.deleteLater()
+                    yscale_btn.deleteLater()
+                except Exception:
+                    pass
+                overlay_axes_by_var.pop(v, None)
+
+        overlay_axes_by_var.clear()
+        overlay_axes_by_var.update({v: ax for v, ax in zip(vars_to_plot, axes)})
+
+        for v in vars_to_plot:
+            if v in overlay_buttons:
+                self._refresh_overlay_button_labels(v)
+                continue
+
+            ylim_btn = QPushButton(canvas)
+            yscale_btn = QPushButton(canvas)
+            ylim_btn.setText(self._ylim_mode_label(self._ylim_mode_by_var.get(v, "auto")))
+            yscale_btn.setText(self._yscale_label(self._yscale_by_var.get(v, "linear")))
+
+            ylim_btn.setFixedHeight(self._overlay_btn_h)
+            yscale_btn.setFixedHeight(self._overlay_btn_h)
+            ylim_btn.setFixedWidth(self._overlay_btn_w_ylim)
+            yscale_btn.setFixedWidth(self._overlay_btn_w_yscale)
+
+            try:
+                style = (
+                    "QPushButton {"
+                    " background: rgba(250, 250, 250, 210);"
+                    " border: 1px solid rgba(0,0,0,80);"
+                    " border-radius: 4px;"
+                    " padding: 1px 4px;"
+                    " font-size: 10px;"
+                    "}"
+                    "QPushButton:pressed { background: rgba(230, 230, 230, 230); }"
+                )
+                ylim_btn.setStyleSheet(style)
+                yscale_btn.setStyleSheet(style)
+            except Exception:
+                pass
+
+            ylim_btn.clicked.connect(partial(self._on_overlay_ylim_clicked, v))
+            yscale_btn.clicked.connect(partial(self._on_overlay_yscale_clicked, v))
+
+            ylim_btn.show()
+            yscale_btn.show()
+            ylim_btn.raise_()
+            yscale_btn.raise_()
+            overlay_buttons[v] = (ylim_btn, yscale_btn)
 
     # ---------- Data loading ----------
     def _load_case(self, case_path: str) -> _LoadedCase:
@@ -1625,7 +1896,7 @@ class Hermes3QtMainWindow(QMainWindow):
             self._update_after_load()
             self._update_datasets_list()
             self.set_status("")
-            self.redraw()
+            self.request_redraw()
             # New dataset -> invalidate cached time history and redraw (debounced)
             try:
                 self._hist_cache.clear()
@@ -1633,6 +1904,11 @@ class Hermes3QtMainWindow(QMainWindow):
                 pass
             try:
                 self._mon_cache.clear()
+            except Exception:
+                pass
+            try:
+                self._pol_cache.clear()
+                self._rad_cache.clear()
             except Exception:
                 pass
             self.request_time_history_redraw()
@@ -1837,7 +2113,8 @@ class Hermes3QtMainWindow(QMainWindow):
         n = len(vars_to_plot)
         nrows = min(3, n)
         ncols = int(np.ceil(n / nrows))
-        gs = self.pol_figure.add_gridspec(nrows=nrows, ncols=ncols, hspace=0.35, wspace=0.30)
+        # Extra vertical padding to avoid title/xlabel overlap between stacked subplots
+        gs = self.pol_figure.add_gridspec(nrows=nrows, ncols=ncols, hspace=0.60, wspace=0.30)
         axes = [self.pol_figure.add_subplot(gs[i % nrows, i // nrows]) for i in range(n)]
 
         try:
@@ -1849,10 +2126,49 @@ class Hermes3QtMainWindow(QMainWindow):
             self.pol_canvas.draw_idle()
             return
 
+        # Batch extract once per case/time/region/sepadd for speed
+        # Configure y-scales per variable before plotting
         for ax, name in zip(axes, vars_to_plot):
-            ax.set_title(f"{name} ({region}, sepadd={sepadd})", fontsize=10)
-            ax.grid(True, alpha=0.3)
+            mode = self._yscale_by_var.get(name, "linear")
+            try:
+                if mode == "log":
+                    ax.set_yscale("log")
+                elif mode == "symlog":
+                    ax.set_yscale("symlog", linthresh=1e-6)
+                else:
+                    ax.set_yscale("linear")
+            except Exception:
+                pass
 
+        for c in self.cases.values():
+            ds_t = self._ds_at_time(c)
+            ti = self._get_time_index_for_case(c)
+            ck = (c.label, ti, region, sepadd, tuple(vars_to_plot))
+            df = self._pol_cache.get(ck)
+            if df is None:
+                try:
+                    df = get_1d_poloidal_data(ds_t, params=list(vars_to_plot), region=region, sepadd=sepadd, target_first=False)
+                except Exception as e:
+                    self.set_status(f"Poloidal extract failed: {e}", is_error=True)
+                    df = None
+                self._pol_cache[ck] = df
+            if df is None:
+                continue
+
+            x = np.asarray(df["Spar"].values)
+            for ax, name in zip(axes, vars_to_plot):
+                ax.set_title(f"{name} ({region}, sepadd={sepadd})", fontsize=10)
+                ax.grid(True, alpha=0.3)
+                try:
+                    y = np.asarray(df[name].values)
+                except Exception:
+                    continue
+                # If log scale, mask non-positive values
+                if self._yscale_by_var.get(name, "linear") == "log":
+                    y = np.where(y > 0, y, np.nan)
+                ax.plot(x, y, label=c.label)
+
+        for ax, name in zip(axes, vars_to_plot):
             # Units (match 1D GUI behavior)
             units = None
             for c in self.cases.values():
@@ -1864,21 +2180,29 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     continue
             ax.set_ylabel(f"({units})" if units else "")
-
-            for c in self.cases.values():
-                ds_t = self._ds_at_time(c)
-                try:
-                    df = get_1d_poloidal_data(ds_t, params=[name], region=region, sepadd=sepadd, target_first=False)
-                    x = np.asarray(df["Spar"].values)
-                    y = np.asarray(df[name].values)
-                    ax.plot(x, y, label=c.label)
-                except Exception as e:
-                    self.set_status(f"Poloidal extract failed for {name}: {e}", is_error=True)
-                    continue
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"S$_\parallel$ (m)")
 
+            # Apply ylim mode using currently plotted data (fast)
+            try:
+                ylim_mode = self._ylim_mode_by_var.get(name, "auto")
+                if ylim_mode == "auto":
+                    ax.relim()
+                    ax.autoscale_view()
+                else:
+                    # "final"/"global" treated as fixed-to-current for these derived lines
+                    ax.relim()
+                    ax.autoscale_view()
+            except Exception:
+                pass
+
+        # Overlay buttons for yscale/ylim (same as 1D)
+        self._sync_overlay_buttons_pol(vars_to_plot=vars_to_plot, axes=axes)
+        try:
+            self.pol_figure.tight_layout()
+        except Exception:
+            pass
         self.pol_canvas.draw_idle()
 
     def _redraw_2d_radial(self) -> None:
@@ -1909,7 +2233,8 @@ class Hermes3QtMainWindow(QMainWindow):
         n = len(vars_to_plot)
         nrows = min(3, n)
         ncols = int(np.ceil(n / nrows))
-        gs = self.rad_figure.add_gridspec(nrows=nrows, ncols=ncols, hspace=0.35, wspace=0.30)
+        # Extra vertical padding to avoid title/xlabel overlap between stacked subplots
+        gs = self.rad_figure.add_gridspec(nrows=nrows, ncols=ncols, hspace=0.60, wspace=0.30)
         axes = [self.rad_figure.add_subplot(gs[i % nrows, i // nrows]) for i in range(n)]
 
         try:
@@ -1923,10 +2248,48 @@ class Hermes3QtMainWindow(QMainWindow):
             self.rad_canvas.draw_idle()
             return
 
+        # Batch extract once per case/time/region for speed
+        # Configure y-scales per variable before plotting
         for ax, name in zip(axes, vars_to_plot):
-            ax.set_title(f"{name} ({region})", fontsize=10)
-            ax.grid(True, alpha=0.3)
+            mode = self._yscale_by_var.get(name, "linear")
+            try:
+                if mode == "log":
+                    ax.set_yscale("log")
+                elif mode == "symlog":
+                    ax.set_yscale("symlog", linthresh=1e-6)
+                else:
+                    ax.set_yscale("linear")
+            except Exception:
+                pass
 
+        for c in self.cases.values():
+            ds_t = self._ds_at_time(c)
+            ti = self._get_time_index_for_case(c)
+            ck = (c.label, ti, region, tuple(vars_to_plot))
+            df = self._rad_cache.get(ck)
+            if df is None:
+                try:
+                    df = get_1d_radial_data(ds_t, params=list(vars_to_plot), region=region, guards=False, sol=True, core=True)
+                except Exception as e:
+                    self.set_status(f"Radial extract failed: {e}", is_error=True)
+                    df = None
+                self._rad_cache[ck] = df
+            if df is None:
+                continue
+
+            x = np.asarray(df["Srad"].values)
+            for ax, name in zip(axes, vars_to_plot):
+                ax.set_title(f"{name} ({region})", fontsize=10)
+                ax.grid(True, alpha=0.3)
+                try:
+                    y = np.asarray(df[name].values)
+                except Exception:
+                    continue
+                if self._yscale_by_var.get(name, "linear") == "log":
+                    y = np.where(y > 0, y, np.nan)
+                ax.plot(x, y, label=c.label)
+
+        for ax, name in zip(axes, vars_to_plot):
             # Units (match 1D GUI behavior)
             units = None
             for c in self.cases.values():
@@ -1938,23 +2301,26 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     continue
             ax.set_ylabel(f"({units})" if units else "")
-
-            for c in self.cases.values():
-                ds_t = self._ds_at_time(c)
-                try:
-                    df = get_1d_radial_data(ds_t, params=[name], region=region, guards=False, sol=True, core=True)
-                    x = np.asarray(df["Srad"].values)
-                    y = np.asarray(df[name].values) if name in df else None
-                    if y is None:
-                        continue
-                    ax.plot(x, y, label=c.label)
-                except Exception as e:
-                    self.set_status(f"Radial extract failed for {name}: {e}", is_error=True)
-                    continue
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"$r^\prime - r_{sep}$ (m)")
 
+            try:
+                ylim_mode = self._ylim_mode_by_var.get(name, "auto")
+                if ylim_mode == "auto":
+                    ax.relim()
+                    ax.autoscale_view()
+                else:
+                    ax.relim()
+                    ax.autoscale_view()
+            except Exception:
+                pass
+
+        self._sync_overlay_buttons_rad(vars_to_plot=vars_to_plot, axes=axes)
+        try:
+            self.rad_figure.tight_layout()
+        except Exception:
+            pass
         self.rad_canvas.draw_idle()
 
     def _redraw_2d_polygon(self) -> None:
@@ -2000,13 +2366,23 @@ class Hermes3QtMainWindow(QMainWindow):
                 )
                 ax.set_title("grid", fontsize=11)
             else:
+                vmin = _parse_optional_float(self.poly_vmin_edit.text())
+                vmax = _parse_optional_float(self.poly_vmax_edit.text())
+                logscale = False
+                try:
+                    logscale = bool(self.poly_log_check.isChecked())
+                except Exception:
+                    logscale = False
                 data.hermesm.clean_guards().bout.polygon(
                     ax=ax,
                     cmap="Spectral_r",
-                    # Semi-transparent gridlines over colormap
+                   
                     linecolor=(0, 0, 0, 0.15),
                     linewidth=0,
                     antialias=True,
+                    logscale=logscale,
+                    vmin=vmin,
+                    vmax=vmax,
                     separatrix=True,
                     separatrix_kwargs={"linewidth": 0.2, "color": "k"},
                     targets=False,
@@ -2304,6 +2680,11 @@ class Hermes3QtMainWindow(QMainWindow):
                     y = np.asarray(da1.values)
                     if self._guard_replace_enabled() and y.ndim == 1 and sdim in getattr(da1, "dims", ()):
                         x, y = _guard_replace_1d_profile_xy(x, y)
+                    # Downsample long traces for responsiveness
+                    try:
+                        x, y = _downsample_xy(x, y, int(self._profile_max_points))
+                    except Exception:
+                        pass
                     if mode == "log":
                         y = np.where(y > 0, y, np.nan)
                     ax.plot(x, y, label=c.label)

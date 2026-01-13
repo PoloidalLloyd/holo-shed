@@ -18,6 +18,14 @@ If you already cloned without submodules:
 git submodule update --init --recursive
 ```
 
+### Python dependencies
+
+Install requirements:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 ## Run
 
 ```bash
