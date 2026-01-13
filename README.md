@@ -25,4 +25,6 @@ python holo-shed.py /path/to/case_dir
 ```
 
 ## Comments
- Attempts have been made to allow for automatic dimension detection to allow for 1D and 2D analysis, however for 2D analysis the grid file must be located in the same directory. Currently 2D version only allows for one data set to be loaded at a time, although this will hopefully be changed in the future. 
+Attempts have been made to allow for automatic dimension detection to allow for 1D and 2D analysis, however for 2D analysis the grid file must be located in the same directory. Currently 2D version only allows for one data set to be loaded at a time, although this will hopefully be changed in the future.
+
+The monitor functionality for 2D is still very barebones and could be improved. 
