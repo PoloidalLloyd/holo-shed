@@ -8,7 +8,7 @@ This repo vendors `sdtools` under `external/sdtools` (as a git submodule).
 Clone with submodules:
 
 ```bash
-git clone --recurse-submodules <YOUR_REPO_URL>
+git clone --recurse-submodules https://github.com/PoloidalLloyd/holo-shed.git
 cd holo-shed
 ```
 
