@@ -1,0 +1,18 @@
+numpy
+matplotlib
+pandas
+scipy
+xarray
+netCDF4
+
+# Qt bindings (holo-shed will use PyQt6 if present, otherwise PySide6)
+PySide6
+
+# Hermes-3 / BOUT++ ecosystem used by sdtools
+boutdata
+boututils
+xbout
+xhermes
+
+# Optional but recommended (sdtools uses it for some features)
+dill
