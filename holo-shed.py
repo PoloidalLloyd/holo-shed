@@ -739,6 +739,12 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_slider_2d.setSingleStep(1)
         self.time_slider_2d.setPageStep(1)
         self.time_slider_2d.setValue(0)
+        # Performance: avoid re-plotting on every tick while dragging.
+        # With tracking off, valueChanged fires on release; we update the label live via sliderMoved.
+        try:
+            self.time_slider_2d.setTracking(False)
+        except Exception:
+            pass
         self.time_readout_2d = QLabel("time index = 0")
         time2d_row.addWidget(self.time_slider_2d, 1)
         time2d_row.addWidget(self.time_readout_2d)
@@ -993,6 +999,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_slider.valueChanged.connect(lambda _v: self.request_redraw())
         self.time_slider_2d.valueChanged.connect(lambda _v: self.request_redraw())
         self.time_slider_2d.valueChanged.connect(lambda _v: self._update_time_readout())
+        self.time_slider_2d.sliderMoved.connect(lambda v: self._set_time_readout_for_index(int(v)))
         self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
         self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
@@ -1137,10 +1144,13 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def request_redraw(self) -> None:
         """
-        Debounced redraw for the currently active plot tab.
+        Immediate redraw for the currently active plot tab.
+
+        (We previously debounced this for performance, but it makes the time slider
+        feel laggy when scrubbing.)
         """
         try:
-            self._redraw_timer.start(80)
+            self.redraw()
         except Exception:
             self._do_redraw()
 
@@ -1956,16 +1966,28 @@ class Hermes3QtMainWindow(QMainWindow):
         return da.isel({sdim: idx})
 
     def _update_time_readout(self) -> None:
-        ti = self._get_time_index()
+        self._set_time_readout_for_index(self._get_time_index())
+
+    def _set_time_readout_for_index(self, ti: int) -> None:
+        """
+        Update the active time readout label for an arbitrary index (used for 2D slider dragging).
+        """
+        # Prefer the active slider's range for a stable "idx/Max" display
+        try:
+            tmax = int(self._active_time_slider().maximum())
+        except Exception:
+            tmax = -1
+        idx_txt = f"time index = {ti}" if tmax < 0 else f"time index = {ti}/{tmax}"
+
         tdim = self.state.get("time_dim")
         tvals = self.state.get("t_values")
         if tdim and tvals is not None and ti < len(tvals):
             try:
-                self._active_time_readout().setText(f"{tdim} = {tvals[ti] * 1e3:.4f} ms")
+                self._active_time_readout().setText(f"{idx_txt}    ({tdim} = {tvals[ti] * 1e3:.4f} ms)")
                 return
             except Exception:
                 pass
-        self._active_time_readout().setText(f"time index = {ti}")
+        self._active_time_readout().setText(idx_txt)
 
     def _compute_ylim_for_final(self, varname: str, tdim: Optional[str], yscale: str) -> Tuple[Optional[float], Optional[float]]:
         ys_all = []
