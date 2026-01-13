@@ -9,6 +9,7 @@ python hermes3_gui_pyqt.py /path/to/case_dir
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 from functools import partial
@@ -76,6 +77,72 @@ def _list_plottable_vars(ds, spatial_dim: str, time_dim: Optional[str]) -> List[
     return sorted(out)
 
 
+def _is_plottable_2d_var(da, time_dim: Optional[str]) -> bool:
+    """
+    Heuristic for Hermes-3 2D fields.
+
+    sdtools uses dims ('x', 'theta') (optionally with 't') for 2D tokamak data.
+    """
+    dims = tuple(getattr(da, "dims", ()))
+    if "x" not in dims or "theta" not in dims:
+        return False
+    if time_dim is None:
+        # allow static fields
+        return set(dims) >= {"x", "theta"}
+    # common cases: (x,theta) or (t,x,theta)
+    if set(dims) >= {"x", "theta"} and (time_dim in dims or time_dim not in dims):
+        return True
+    return False
+
+
+def _list_plottable_vars_2d(ds, time_dim: Optional[str]) -> List[str]:
+    out: List[str] = []
+    for name, da in ds.data_vars.items():
+        try:
+            if _is_plottable_2d_var(da, time_dim=time_dim):
+                out.append(name)
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def _guard_replace_1d_profile_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Guard-replace for *profiles* (x,y arrays).
+
+    Behavior (as requested):
+    - Strip the *outer* guard cells (drop first and last points)
+    - Replace the remaining inner guard cell values by averaging with the adjacent
+      last/first real cell, so the endpoints represent the last real face values.
+
+    Assumed indexing (common in Hermes-3 1D outputs):
+    - index 0 and -1 are the unused "outer" guards
+    - index 1 is the inlet-side inner guard, index 2 is first real cell
+    - index -2 is the target-side inner guard, index -3 is last real cell
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size or x.size < 4:
+        return x, y
+
+    # Strip outer guard cells
+    xx = x[1:-1].copy()
+    yy = y[1:-1].copy()
+
+    try:
+        # Inlet face: average (inner guard, first real)
+        yy[0] = 0.5 * (y[1] + y[2])
+        xx[0] = 0.5 * (x[1] + x[2])
+
+        # Target face: average (inner guard, last real)
+        yy[-1] = 0.5 * (y[-2] + y[-3])
+        xx[-1] = 0.5 * (x[-2] + x[-3])
+    except Exception:
+        return x, y
+
+    return xx, yy
+
+
 def _format_case_label(case_path: str) -> str:
     p = Path(case_path).expanduser().resolve()
     return p.name or str(p)
@@ -87,6 +154,225 @@ class _LoadedCase:
     case_path: str
     ds: "object"  # xarray.Dataset (kept generic)
     n_time: int = 1
+    is_2d: bool = False
+
+
+def _pick_bout_output_for_probe(case_dir: Path) -> Path:
+    """
+    Pick a representative BOUT output file for cheap metadata probing.
+
+    Prefer squashed output (single file) when available.
+    """
+    # Prefer squashed output if present
+    squash = case_dir / "BOUT.squash.nc"
+    if squash.exists():
+        return squash
+
+    # Prefer the first dump file if present (common naming)
+    d0 = case_dir / "BOUT.dmp.0.nc"
+    if d0.exists():
+        return d0
+
+    # Fall back to any dump file
+    dmps = sorted(case_dir.glob("BOUT.dmp.*.nc"))
+    if dmps:
+        return dmps[0]
+
+    raise FileNotFoundError(
+        f"Could not find BOUT output in {case_dir} (expected BOUT.squash.nc or BOUT.dmp.*.nc)."
+    )
+
+
+def _probe_is_2d_case(case_dir: Path) -> bool:
+    """
+    Fast 1D vs 2D probe using only netCDF metadata.
+
+    Hermes-3 2D tokamak outputs are typically (x, y, t) in raw BOUT files, and
+    become (x, theta, t) after xHermes processing.
+
+    Some "1D" cases may still include an `x` dimension of length 1, so we require:
+      - `x` AND (`theta` OR `y`) AND len(x) > 1
+    """
+    probe_path = _pick_bout_output_for_probe(case_dir)
+    try:
+        # netCDF4 is commonly available via xbout/boutdata dependencies.
+        from netCDF4 import Dataset  # type: ignore
+
+        with Dataset(str(probe_path), mode="r") as ds:
+            dims = ds.dimensions
+            if "x" not in dims:
+                return False
+            nx = int(len(dims["x"]))
+            has_pol = ("theta" in dims) or ("y" in dims)
+            if not has_pol:
+                return False
+            return nx > 1
+    except Exception:
+        # Fallback: a lightweight xarray open also tends to only read metadata
+        # (but requires an engine; if that fails too, we'll raise a clear error).
+        try:
+            import xarray as xr  # type: ignore
+
+            with xr.open_dataset(str(probe_path), decode_cf=False, mask_and_scale=False) as ds:
+                if "x" not in ds.dims:
+                    return False
+                nx = int(ds.sizes.get("x", 0))
+                has_pol = ("theta" in ds.dims) or ("y" in ds.dims)
+                if not has_pol:
+                    return False
+                return nx > 1
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to probe case dimensionality from {probe_path}.\n"
+                "Tried netCDF4 and xarray. Original error:\n"
+                f"{e}"
+            ) from e
+
+
+def _parse_mesh_grid_filename_from_bout_inp(inp_path: Path) -> Optional[str]:
+    """
+    Parse BOUT.inp for:
+
+      [mesh]
+      file = "grid.nc"
+
+    Returns the filename (not a path) if found, else None.
+    """
+    try:
+        txt = inp_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return None
+
+    section = None
+    for raw in txt:
+        # Strip comments (BOUT inputs commonly use '#')
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        m = re.match(r"^\[(.+?)\]\s*$", line)
+        if m:
+            section = m.group(1).strip().lower()
+            continue
+
+        if section != "mesh":
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, val = line.split("=", 1)
+        key = key.strip().lower()
+        if key != "file":
+            continue
+
+        val = val.strip().strip('"').strip("'").strip()
+        if not val:
+            return None
+        return val
+
+    return None
+
+
+def _ensure_sdtools_2d_metadata(ds) -> None:
+    """
+    sdtools' 2D selectors expect certain derived keys in `ds.metadata`
+    (e.g. omp_a/omp_b/imp_a/imp_b). When loading via xHermes these may be missing.
+
+    This function back-fills those keys from the base separatrix indices + guard sizes.
+    """
+    try:
+        m = ds.metadata
+        if not isinstance(m, dict):
+            return
+    except Exception:
+        return
+
+    # Only meaningful for 2D tokamak datasets
+    try:
+        dims = getattr(ds, "dims", {})
+        if "x" not in dims or "theta" not in dims:
+            return
+    except Exception:
+        pass
+
+    need_midplanes = not all(k in m for k in ("omp_a", "omp_b", "imp_a", "imp_b"))
+
+    try:
+        topology = str(m.get("topology", "")).lower()
+        MYG = int(m.get("MYG", 0))
+        MXG = int(m.get("MXG", 0))
+
+        j1_1 = int(m["jyseps1_1"])
+        j1_2 = int(m["jyseps1_2"])
+        j2_1 = int(m["jyseps2_1"])
+        j2_2 = int(m["jyseps2_2"])
+
+        ixseps1 = int(m.get("ixseps1", 0))
+        ixseps2 = int(m.get("ixseps2", ixseps1))
+    except Exception:
+        # Missing base metadata; cannot derive midplane indices,
+        # but we can still provide geometry variable aliases below.
+        topology = str(m.get("topology", "")).lower()
+        MYG = int(m.get("MYG", 0) or 0)
+        MXG = int(m.get("MXG", 0) or 0)
+        j1_1 = j1_2 = j2_1 = j2_2 = 0
+        ixseps1 = int(m.get("ixseps1", 0) or 0)
+        ixseps2 = int(m.get("ixseps2", ixseps1) or ixseps1)
+
+    # Targets list mirrors sdtools' expectations
+    if "single-null" in topology:
+        targets = ["inner_lower", "outer_lower"]
+    elif "double-null" in topology:
+        targets = ["inner_lower", "outer_lower", "inner_upper", "outer_upper"]
+    else:
+        # Unknown topology; still allow aliasing below
+        targets = list(m.get("targets") or [])
+
+    num_targets = len(targets) if targets else 0
+
+    # Guard-adjusted separatrix indices
+    m.setdefault("ixseps1g", ixseps1 - MXG)
+    m.setdefault("ixseps2g", ixseps2 - MXG)
+
+    if need_midplanes and num_targets:
+        # jyseps accounting for y-guards
+        j1_1g = j1_1 + MYG
+        j2_1g = j2_1 + MYG
+        # second divertor leg is offset by (num_targets-1) guard blocks
+        j1_2g = j1_2 + MYG * (num_targets - 1)
+        j2_2g = j2_2 + MYG * (num_targets - 1)
+
+        m.setdefault("j1_1g", j1_1g)
+        m.setdefault("j2_1g", j2_1g)
+        m.setdefault("j1_2g", j1_2g)
+        m.setdefault("j2_2g", j2_2g)
+
+        # Midplane indices used by sdtools selectors
+        # (matches sdtools hermes3/load.py extract_2d_tokamak_geometry)
+        try:
+            omp_a = int((j2_2g - j1_2g) / 2) + j1_2g
+            omp_b = omp_a + 1
+            imp_a = int((j2_1g - j1_1g) / 2) + j1_1g + 1
+            imp_b = int((j2_1g - j1_1g) / 2) + j1_1g
+            m.setdefault("omp_a", omp_a)
+            m.setdefault("omp_b", omp_b)
+            m.setdefault("imp_a", imp_a)
+            m.setdefault("imp_b", imp_b)
+        except Exception:
+            pass
+
+    # Keep a consistent targets list for downstream logic
+    if targets:
+        m.setdefault("targets", targets)
+
+    # sdtools selectors expect some geometry variable names which may differ depending on loader.
+    # xHermes commonly uses "dl" for poloidal arc length; sdtools expects "dpol".
+    try:
+        if "dpol" not in ds and "dl" in ds:
+            ds["dpol"] = ds["dl"]
+    except Exception:
+        pass
 
 
 def _ensure_sdtools_on_path():
@@ -135,6 +421,8 @@ try:
     from PyQt6.QtWidgets import (  # type: ignore
         QAbstractItemView,
         QApplication,
+        QCheckBox,
+        QComboBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -165,6 +453,8 @@ except Exception:  # pragma: no cover
     from PySide6.QtWidgets import (  # type: ignore
         QAbstractItemView,
         QApplication,
+        QCheckBox,
+        QComboBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -265,6 +555,14 @@ class Hermes3QtMainWindow(QMainWindow):
                 f"Original error: {e}"
             ) from e
 
+        # Ensure sdtools xarray accessors are registered.
+        # (Without this, datasets won't have `.hermesm` and 2D mode will crash.)
+        try:
+            import hermes3.accessors  # type: ignore  # noqa: F401
+        except Exception:
+            # Not fatal for 1D mode; 2D features will raise clearer errors later.
+            pass
+
         self.Load = Load
 
         self.setWindowTitle(f"Hermes-3 GUI (1D) - Qt ({_QT_API})")
@@ -272,6 +570,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.cases: Dict[str, _LoadedCase] = {}
         self.spatial_dim_forced = spatial_dim
         self.state = dict(spatial_dim=None, time_dim=None, vars=[], t_values=None)
+        self._mode_is_2d = False
 
         self.selected_vars: List[str] = []  # preserve selection order
         self._selected_set: set[str] = set()
@@ -304,6 +603,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self._hist_redraw_timer.timeout.connect(self._do_redraw_time_history)
         self._hist_cache: Dict[tuple, tuple] = {}
         self._hist_max_points = 2000  # downsample long traces for responsiveness
+        self._mon_cache: Dict[tuple, tuple] = {}
 
         if initial_case_path:
             self.path_edit.setText(str(initial_case_path))
@@ -371,6 +671,26 @@ class Hermes3QtMainWindow(QMainWindow):
         self.deselect_btn = QPushButton("Deselect All")
         left_layout.addWidget(self.deselect_btn)
 
+        # 2D-only time slider (kept out of the 1D plot layout so 1D UI stays unchanged)
+        self.time2d_widget = QWidget()
+        time2d_layout = QVBoxLayout(self.time2d_widget)
+        time2d_layout.setContentsMargins(0, 0, 0, 0)
+        time2d_layout.setSpacing(4)
+        time2d_layout.addWidget(QLabel("2D time index"))
+        time2d_row = QHBoxLayout()
+        self.time_slider_2d = QSlider(Qt.Orientation.Horizontal)
+        self.time_slider_2d.setMinimum(0)
+        self.time_slider_2d.setMaximum(0)
+        self.time_slider_2d.setSingleStep(1)
+        self.time_slider_2d.setPageStep(1)
+        self.time_slider_2d.setValue(0)
+        self.time_readout_2d = QLabel("time index = 0")
+        time2d_row.addWidget(self.time_slider_2d, 1)
+        time2d_row.addWidget(self.time_readout_2d)
+        time2d_layout.addLayout(time2d_row)
+        self.time2d_widget.setVisible(False)
+        left_layout.addWidget(self.time2d_widget)
+
         # Per-view controls (selection is shared)
         self.controls_tabs = QTabWidget()
 
@@ -380,6 +700,9 @@ class Hermes3QtMainWindow(QMainWindow):
         prof_ctrl_layout.setContentsMargins(6, 6, 6, 6)
         prof_ctrl_layout.setSpacing(6)
         prof_ctrl_layout.addWidget(QLabel("Profiles controls:\n- Use the overlay buttons on each plot for y-scale and y-limits.\n- Or right-click a variable to set modes."))
+        self.guard_replace_check = QCheckBox("Replace guard cells (1D only)")
+        self.guard_replace_check.setChecked(True)
+        prof_ctrl_layout.addWidget(self.guard_replace_check)
         prof_ctrl_layout.addStretch(1)
 
         # Time history controls
@@ -411,9 +734,77 @@ class Hermes3QtMainWindow(QMainWindow):
         hist_ctrl_layout.addLayout(ctrl_row)
         hist_ctrl_layout.addStretch(1)
 
-        self.controls_tabs.addTab(prof_ctrl_tab, "Profiles")
-        self.controls_tabs.addTab(hist_ctrl_tab, "Time history")
+        self._ctrl1d_profiles = prof_ctrl_tab
+        self._ctrl1d_history = hist_ctrl_tab
         left_layout.addWidget(self.controls_tabs)
+
+        # --- 2D controls tabs (created once; added/removed depending on mode) ---
+        self._pol_ctrl_tab = QWidget()
+        pol_ctrl_layout = QVBoxLayout(self._pol_ctrl_tab)
+        pol_ctrl_layout.setContentsMargins(6, 6, 6, 6)
+        pol_ctrl_layout.setSpacing(6)
+        pol_ctrl_layout.addWidget(QLabel("Poloidal 1D (SOL ring)"))
+        pol_region_row = QHBoxLayout()
+        pol_region_row.addWidget(QLabel("region"))
+        self.pol_region_combo = QComboBox()
+        self.pol_region_combo.addItems(["outer_lower", "outer_upper", "inner_lower", "inner_upper"])
+        pol_region_row.addWidget(self.pol_region_combo, 1)
+        pol_ctrl_layout.addLayout(pol_region_row)
+
+        pol_sepadd_row = QHBoxLayout()
+        pol_sepadd_row.addWidget(QLabel("sepadd (SOL ring index)"))
+        self.pol_sepadd_spin = QSpinBox()
+        self.pol_sepadd_spin.setRange(0, 1000000)
+        self.pol_sepadd_spin.setValue(0)
+        pol_sepadd_row.addWidget(self.pol_sepadd_spin)
+        pol_sepadd_row.addStretch(1)
+        pol_ctrl_layout.addLayout(pol_sepadd_row)
+        pol_ctrl_layout.addStretch(1)
+
+        self._rad_ctrl_tab = QWidget()
+        rad_ctrl_layout = QVBoxLayout(self._rad_ctrl_tab)
+        rad_ctrl_layout.setContentsMargins(6, 6, 6, 6)
+        rad_ctrl_layout.setSpacing(6)
+        rad_ctrl_layout.addWidget(QLabel("Radial 1D"))
+        rad_region_row = QHBoxLayout()
+        rad_region_row.addWidget(QLabel("region"))
+        self.rad_region_combo = QComboBox()
+        self.rad_region_combo.addItems(
+            [
+                "omp",
+                "imp",
+                "outer_lower_target",
+                "outer_upper_target",
+                "inner_lower_target",
+                "inner_upper_target",
+            ]
+        )
+        rad_region_row.addWidget(self.rad_region_combo, 1)
+        rad_ctrl_layout.addLayout(rad_region_row)
+        rad_ctrl_layout.addStretch(1)
+
+        self._poly_ctrl_tab = QWidget()
+        poly_ctrl_layout = QVBoxLayout(self._poly_ctrl_tab)
+        poly_ctrl_layout.setContentsMargins(6, 6, 6, 6)
+        poly_ctrl_layout.setSpacing(6)
+        poly_ctrl_layout.addWidget(QLabel("2D field plot"))
+        poly_var_row = QHBoxLayout()
+        poly_var_row.addWidget(QLabel("variable"))
+        self.poly_var_combo = QComboBox()
+        poly_var_row.addWidget(self.poly_var_combo, 1)
+        poly_ctrl_layout.addLayout(poly_var_row)
+
+        self.poly_grid_only_check = QCheckBox("grid only (no colormap)")
+        self.poly_grid_only_check.setChecked(False)
+        poly_ctrl_layout.addWidget(self.poly_grid_only_check)
+        poly_ctrl_layout.addStretch(1)
+
+        self._mon_ctrl_tab = QWidget()
+        mon_ctrl_layout = QVBoxLayout(self._mon_ctrl_tab)
+        mon_ctrl_layout.setContentsMargins(6, 6, 6, 6)
+        mon_ctrl_layout.setSpacing(6)
+        mon_ctrl_layout.addWidget(QLabel("Monitor: Te/Ne at OMP + target"))
+        mon_ctrl_layout.addStretch(1)
 
         # Right panel
         right = QWidget()
@@ -424,7 +815,7 @@ class Hermes3QtMainWindow(QMainWindow):
         # Plot tabs (Profiles vs Time history)
         self.plot_tabs = QTabWidget()
 
-        # Profiles plot tab
+        # ---- 1D plot tabs ----
         prof_plot_tab = QWidget()
         prof_plot_layout = QVBoxLayout(prof_plot_tab)
         prof_plot_layout.setContentsMargins(0, 0, 0, 0)
@@ -444,12 +835,12 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_slider.setPageStep(1)
         self.time_slider.setValue(0)
         self.time_readout = QLabel("time index = 0")
-        slider_row.addWidget(QLabel("time index"))
+        self._time_index_label_1d = QLabel("time index")
+        slider_row.addWidget(self._time_index_label_1d)
         slider_row.addWidget(self.time_slider, 1)
         slider_row.addWidget(self.time_readout)
         prof_plot_layout.addLayout(slider_row)
 
-        # Time history plot tab
         hist_plot_tab = QWidget()
         hist_plot_layout = QVBoxLayout(hist_plot_tab)
         hist_plot_layout.setContentsMargins(0, 0, 0, 0)
@@ -464,8 +855,52 @@ class Hermes3QtMainWindow(QMainWindow):
         self.hist_time_readout = QLabel("Time history")
         hist_plot_layout.addWidget(self.hist_time_readout)
 
-        self.plot_tabs.addTab(prof_plot_tab, "Profiles")
-        self.plot_tabs.addTab(hist_plot_tab, "Time history")
+        self._tab1d_profiles = prof_plot_tab
+        self._tab1d_history = hist_plot_tab
+
+        # ---- 2D plot tabs (created once; attached depending on mode) ----
+        self._tab2d_poloidal = QWidget()
+        pol_plot_layout = QVBoxLayout(self._tab2d_poloidal)
+        pol_plot_layout.setContentsMargins(0, 0, 0, 0)
+        pol_plot_layout.setSpacing(6)
+        self.pol_figure = Figure(figsize=(10.5, 7.5))
+        self.pol_canvas = FigureCanvas(self.pol_figure)
+        self.pol_toolbar = NavigationToolbar(self.pol_canvas, self)
+        pol_plot_layout.addWidget(self.pol_toolbar)
+        pol_plot_layout.addWidget(self.pol_canvas, 1)
+
+        self._tab2d_radial = QWidget()
+        rad_plot_layout = QVBoxLayout(self._tab2d_radial)
+        rad_plot_layout.setContentsMargins(0, 0, 0, 0)
+        rad_plot_layout.setSpacing(6)
+        self.rad_figure = Figure(figsize=(10.5, 7.5))
+        self.rad_canvas = FigureCanvas(self.rad_figure)
+        self.rad_toolbar = NavigationToolbar(self.rad_canvas, self)
+        rad_plot_layout.addWidget(self.rad_toolbar)
+        rad_plot_layout.addWidget(self.rad_canvas, 1)
+
+        self._tab2d_polygon = QWidget()
+        poly_plot_layout = QVBoxLayout(self._tab2d_polygon)
+        poly_plot_layout.setContentsMargins(0, 0, 0, 0)
+        poly_plot_layout.setSpacing(6)
+        self.poly_figure = Figure(figsize=(10.5, 7.5))
+        self.poly_canvas = FigureCanvas(self.poly_figure)
+        self.poly_toolbar = NavigationToolbar(self.poly_canvas, self)
+        poly_plot_layout.addWidget(self.poly_toolbar)
+        poly_plot_layout.addWidget(self.poly_canvas, 1)
+
+        self._tab2d_monitor = QWidget()
+        mon_plot_layout = QVBoxLayout(self._tab2d_monitor)
+        mon_plot_layout.setContentsMargins(0, 0, 0, 0)
+        mon_plot_layout.setSpacing(6)
+        self.mon_figure = Figure(figsize=(10.5, 7.5))
+        self.mon_canvas = FigureCanvas(self.mon_figure)
+        self.mon_toolbar = NavigationToolbar(self.mon_canvas, self)
+        mon_plot_layout.addWidget(self.mon_toolbar)
+        mon_plot_layout.addWidget(self.mon_canvas, 1)
+
+        # Attach initial (1D) tabs
+        self._configure_tabs(is_2d=False)
         right_layout.addWidget(self.plot_tabs, 1)
 
         splitter.addWidget(left)
@@ -486,12 +921,114 @@ class Hermes3QtMainWindow(QMainWindow):
         self.vars_list.itemDoubleClicked.connect(self._on_var_item_double_clicked)
         self.vars_list.customContextMenuRequested.connect(self._on_var_list_context_menu)
         self.time_slider.valueChanged.connect(lambda _v: self.redraw())
+        self.time_slider_2d.valueChanged.connect(lambda _v: self.redraw())
+        self.time_slider_2d.valueChanged.connect(lambda _v: self._update_time_readout())
+        self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.redraw())
+        self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.redraw())
+        self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.redraw())
+        self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.redraw())
+        self.poly_grid_only_check.toggled.connect(lambda _v: self.redraw())
+        self.guard_replace_check.toggled.connect(lambda _v: self.redraw())
+        self.guard_replace_check.toggled.connect(lambda _v: self.request_time_history_redraw())
         self.hist_upstream_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
         self.hist_target_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
         self.hist_time_slices_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
 
         # Redraw correct tab when switching
         self.plot_tabs.currentChanged.connect(self._on_plot_tab_changed)
+
+    def _configure_tabs(self, *, is_2d: bool) -> None:
+        """
+        Swap between 1D and 2D GUI layouts (tabs + controls).
+
+        1D:
+          - Profiles + Time history
+        2D:
+          - Poloidal 1D + Radial 1D + 2D field + Monitor
+        """
+        self._mode_is_2d = bool(is_2d)
+
+        # Plot tabs
+        try:
+            self.plot_tabs.blockSignals(True)
+            self.plot_tabs.clear()
+        finally:
+            try:
+                self.plot_tabs.blockSignals(False)
+            except Exception:
+                pass
+
+        # Controls tabs
+        try:
+            self.controls_tabs.blockSignals(True)
+            self.controls_tabs.clear()
+        finally:
+            try:
+                self.controls_tabs.blockSignals(False)
+            except Exception:
+                pass
+
+        if self._mode_is_2d:
+            self.setWindowTitle(f"Hermes-3 GUI (2D) - Qt ({_QT_API})")
+            try:
+                self.add_btn.setEnabled(False)
+            except Exception:
+                pass
+            self.plot_tabs.addTab(self._tab2d_poloidal, "Poloidal 1D")
+            self.plot_tabs.addTab(self._tab2d_radial, "Radial 1D")
+            self.plot_tabs.addTab(self._tab2d_polygon, "2D field")
+            self.plot_tabs.addTab(self._tab2d_monitor, "Monitor")
+
+            self.controls_tabs.addTab(self._pol_ctrl_tab, "Poloidal 1D")
+            self.controls_tabs.addTab(self._rad_ctrl_tab, "Radial 1D")
+            self.controls_tabs.addTab(self._poly_ctrl_tab, "2D field")
+            self.controls_tabs.addTab(self._mon_ctrl_tab, "Monitor")
+
+            # Show global 2D time control; hide 1D slider embedded in profiles tab.
+            try:
+                self.time2d_widget.setVisible(True)
+            except Exception:
+                pass
+            for w in (getattr(self, "_time_index_label_1d", None), getattr(self, "time_slider", None), getattr(self, "time_readout", None)):
+                try:
+                    if w is not None:
+                        w.setVisible(False)
+                except Exception:
+                    pass
+        else:
+            self.setWindowTitle(f"Hermes-3 GUI (1D) - Qt ({_QT_API})")
+            try:
+                self.add_btn.setEnabled(True)
+            except Exception:
+                pass
+            self.plot_tabs.addTab(self._tab1d_profiles, "Profiles")
+            self.plot_tabs.addTab(self._tab1d_history, "Time history")
+
+            self.controls_tabs.addTab(self._ctrl1d_profiles, "Profiles")
+            self.controls_tabs.addTab(self._ctrl1d_history, "Time history")
+
+            try:
+                self.time2d_widget.setVisible(False)
+            except Exception:
+                pass
+            for w in (getattr(self, "_time_index_label_1d", None), getattr(self, "time_slider", None), getattr(self, "time_readout", None)):
+                try:
+                    if w is not None:
+                        w.setVisible(True)
+                except Exception:
+                    pass
+
+        # Keep controls tab aligned with plot tab
+        try:
+            self.controls_tabs.setCurrentIndex(int(self.plot_tabs.currentIndex()))
+        except Exception:
+            pass
+
+    def _active_time_slider(self) -> "QSlider":
+        return self.time_slider_2d if self._mode_is_2d else self.time_slider
+
+    def _active_time_readout(self) -> "QLabel":
+        return self.time_readout_2d if self._mode_is_2d else self.time_readout
 
     # ---------- Status / datasets ----------
     def set_status(self, msg: str, *, is_error: bool = False) -> None:
@@ -501,15 +1038,23 @@ class Hermes3QtMainWindow(QMainWindow):
     def _on_plot_tab_changed(self, index: int) -> None:
  
         try:
-            # Sync the controls tab with the plot tab (0=Profiles, 1=Time history)
+            # Sync the controls tab with the plot tab
             self.controls_tabs.setCurrentIndex(int(index))
         except Exception:
             pass
-        # Redraw both (cheap enough and keeps state consistent)
-        self.redraw()
-        self.request_time_history_redraw()
+        if self._mode_is_2d:
+            self._redraw_2d_current_tab()
+        else:
+            # Redraw both (cheap enough and keeps state consistent)
+            self.redraw()
+            self.request_time_history_redraw()
 
     def request_time_history_redraw(self) -> None:
+
+        if self._mode_is_2d:
+            # 2D mode uses the Monitor tab instead of the 1D time-history view.
+            self._redraw_2d_monitor()
+            return
 
         try:
             self._hist_redraw_timer.start(120)
@@ -521,7 +1066,7 @@ class Hermes3QtMainWindow(QMainWindow):
         if not self.cases:
             self.datasets_label.setText("Loaded datasets: (none)")
             return
-        labels = [c.label for c in self.cases.values()]
+        labels = [f"{c.label}{' (2D)' if getattr(c, 'is_2d', False) else ' (1D)'}" for c in self.cases.values()]
         if len(labels) <= 2:
             items = "\n".join(f"- {lbl}" for lbl in labels)
             self.datasets_label.setText(f"Loaded datasets ({len(labels)}):\n{items}")
@@ -894,18 +1439,83 @@ class Hermes3QtMainWindow(QMainWindow):
     def _load_case(self, case_path: str) -> _LoadedCase:
         case_path = str(Path(case_path).expanduser().resolve())
         label = _format_case_label(case_path)
-        cs = self.Load.case_1D(case_path, verbose=False)
+        case_dir = Path(case_path)
+
+        # Decide 1D vs 2D cheaply (metadata-only) to avoid double-loading.
+        # Add a fallback path so loading a 2D case while in "1D mode" (or vice versa)
+        # still works and automatically switches the GUI after load.
+        is_2d_probe = _probe_is_2d_case(case_dir)
+
+        def _load_2d():
+            # For now assume the grid file lives alongside the case output.
+            # Most cases specify this in BOUT.inp under [mesh] file = ...
+            grid_name = _parse_mesh_grid_filename_from_bout_inp(case_dir / "BOUT.inp")
+            if not grid_name:
+                raise FileNotFoundError(
+                    "Detected a 2D case but could not find the grid file in BOUT.inp under:\n"
+                    "  [mesh]\n"
+                    "  file = \"...\"\n"
+                    f"Case directory: {case_dir}"
+                )
+            grid_path = (case_dir / grid_name).resolve()
+            if not grid_path.exists():
+                raise FileNotFoundError(
+                    "Detected a 2D case but the grid file listed in BOUT.inp was not found:\n"
+                    f"  grid: {grid_path}\n"
+                    f"  case: {case_dir}"
+                )
+            cs2 = self.Load.case_2D(case_path, gridfilepath=str(grid_path), verbose=False)
+            try:
+                _ensure_sdtools_2d_metadata(cs2.ds)
+            except Exception:
+                pass
+            return cs2
+
+        def _load_1d():
+            # Newer xHermes versions may not provide ds.hermes.guard_replace_1d(),
+            # which sdtools tries to call when guard_replace=True. Disable it here.
+            return self.Load.case_1D(case_path, verbose=False, guard_replace=False)
+
+        cs = None
+        is_2d = False
+        if is_2d_probe:
+            try:
+                cs = _load_2d()
+                is_2d = True
+            except Exception:
+                cs = _load_1d()
+                is_2d = False
+        else:
+            try:
+                cs = _load_1d()
+                is_2d = False
+            except Exception as e:
+                msg = str(e).lower()
+                if ("toroidal" in msg and "grid" in msg) or ("topology" in msg and "grid" in msg) or ("provide grid" in msg):
+                    cs = _load_2d()
+                    is_2d = True
+                else:
+                    raise
         tdim = _infer_time_dim(cs.ds)
         n_time = int(cs.ds.sizes[tdim]) if tdim and tdim in cs.ds.dims else 1
-        return _LoadedCase(label=label, case_path=case_path, ds=cs.ds, n_time=n_time)
+        return _LoadedCase(label=label, case_path=case_path, ds=cs.ds, n_time=n_time, is_2d=is_2d)
 
     def _recompute_all_vars(self) -> Tuple[List[str], Optional[str], Optional[str]]:
         if not self.cases:
             return [], None, None
-        first = next(iter(self.cases.values())).ds
+        first_case = next(iter(self.cases.values()))
+        first = first_case.ds
         tdim = _infer_time_dim(first)
-        sdim = self.spatial_dim_forced or _infer_spatial_dim(first)
+        is_2d = bool(getattr(first_case, "is_2d", False))
 
+        if is_2d:
+            # 2D Hermes-3 typically uses dims ('x','theta') (+ optional time dim)
+            all_vars = set(_list_plottable_vars_2d(first, time_dim=tdim))
+            for c in list(self.cases.values())[1:]:
+                all_vars |= set(_list_plottable_vars_2d(c.ds, time_dim=tdim))
+            return sorted(all_vars), "theta", tdim
+
+        sdim = self.spatial_dim_forced or _infer_spatial_dim(first)
         all_vars = set(_list_plottable_vars(first, spatial_dim=sdim, time_dim=tdim))
         for c in list(self.cases.values())[1:]:
             all_vars |= set(_list_plottable_vars(c.ds, spatial_dim=sdim, time_dim=tdim))
@@ -913,20 +1523,32 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _set_time_range(self, n_t: int) -> None:
         n_t = max(1, int(n_t))
-        self.time_slider.blockSignals(True)
-        try:
-            self.time_slider.setMinimum(0)
-            self.time_slider.setMaximum(max(0, n_t - 1))
-            # set to final time step by default
-            self.time_slider.setValue(n_t - 1)
-        finally:
-            self.time_slider.blockSignals(False)
+        for slider in (getattr(self, "time_slider", None), getattr(self, "time_slider_2d", None)):
+            if slider is None:
+                continue
+            slider.blockSignals(True)
+            try:
+                slider.setMinimum(0)
+                slider.setMaximum(max(0, n_t - 1))
+                # set to final time step by default
+                slider.setValue(n_t - 1)
+            finally:
+                slider.blockSignals(False)
 
     def _update_after_load(self) -> None:
         vars_, sdim, tdim = self._recompute_all_vars()
         self.state["vars"] = vars_
         self.state["spatial_dim"] = sdim
         self.state["time_dim"] = tdim
+
+        # Switch UI mode to match data dimensionality
+        try:
+            first_case = next(iter(self.cases.values()))
+            is_2d = bool(getattr(first_case, "is_2d", False))
+        except Exception:
+            is_2d = False
+        if bool(is_2d) != bool(self._mode_is_2d):
+            self._configure_tabs(is_2d=bool(is_2d))
 
         # Drop selections that no longer exist
         if vars_:
@@ -957,7 +1579,24 @@ class Hermes3QtMainWindow(QMainWindow):
         max_n_t = max((c.n_time for c in self.cases.values()), default=1)
         self._set_time_range(max_n_t)
 
+        # Populate 2D field variable selector
+        try:
+            self.poly_var_combo.blockSignals(True)
+            self.poly_var_combo.clear()
+            for v in vars_:
+                self.poly_var_combo.addItem(v)
+            if "Te" in vars_:
+                self.poly_var_combo.setCurrentText("Te")
+            elif vars_:
+                self.poly_var_combo.setCurrentIndex(0)
+        finally:
+            try:
+                self.poly_var_combo.blockSignals(False)
+            except Exception:
+                pass
+
         self._render_var_list()
+        self._update_time_readout()
 
     def load_dataset(self, *, replace: bool) -> None:
         p = (self.path_edit.text() or "").strip()
@@ -966,6 +1605,20 @@ class Hermes3QtMainWindow(QMainWindow):
             return
         try:
             lc = self._load_case(p)
+
+            # Prevent mixing 1D and 2D cases in one session (UI/plotting differs).
+            if self.cases and (not replace):
+                existing_is_2d = bool(next(iter(self.cases.values())).is_2d)
+                if bool(lc.is_2d) != bool(existing_is_2d):
+                    raise ValueError(
+                        "Cannot mix 1D and 2D cases in the same session. "
+                        "Use 'Load dataset' (replace) to switch modes."
+                    )
+
+            # For now keep 2D mode single-case (simplifies polygon + monitor plotting).
+            if self.cases and (not replace) and bool(next(iter(self.cases.values())).is_2d):
+                raise ValueError("2D mode currently supports a single loaded case. Use 'Load dataset' (replace).")
+
             if replace:
                 self.cases.clear()
             self.cases[lc.label] = lc
@@ -978,6 +1631,10 @@ class Hermes3QtMainWindow(QMainWindow):
                 self._hist_cache.clear()
             except Exception:
                 pass
+            try:
+                self._mon_cache.clear()
+            except Exception:
+                pass
             self.request_time_history_redraw()
         except Exception as e:
             self.set_status(f"Failed to load dataset: {e}", is_error=True)
@@ -985,7 +1642,7 @@ class Hermes3QtMainWindow(QMainWindow):
     # ---------- Plotting ----------
     def _get_time_index(self) -> int:
         try:
-            return int(self.time_slider.value())
+            return int(self._active_time_slider().value())
         except Exception:
             return 0
 
@@ -993,17 +1650,46 @@ class Hermes3QtMainWindow(QMainWindow):
         ti = self._get_time_index()
         return min(ti, case.n_time - 1)
 
+    def _guard_replace_enabled(self) -> bool:
+        try:
+            return (not self._mode_is_2d) and bool(self.guard_replace_check.isChecked())
+        except Exception:
+            return False
+
+    def _isel_1d_with_guard_replace(self, da, *, sdim: str, idx: int):
+        """
+        For 1D datasets, emulate guard replacement when selecting inlet/target indices.
+        """
+        if not self._guard_replace_enabled():
+            return da.isel({sdim: idx})
+
+        n = None
+        try:
+            n = int(da.sizes.get(sdim))
+        except Exception:
+            n = None
+        if not n or n < 4:
+            return da.isel({sdim: idx})
+
+        # Convert negative to positive for comparison
+        idx_pos = idx if idx >= 0 else (n + idx)
+        if idx_pos == 1:
+            return 0.5 * (da.isel({sdim: 1}) + da.isel({sdim: 2}))
+        if idx_pos == (n - 2):
+            return 0.5 * (da.isel({sdim: -2}) + da.isel({sdim: -3}))
+        return da.isel({sdim: idx})
+
     def _update_time_readout(self) -> None:
         ti = self._get_time_index()
         tdim = self.state.get("time_dim")
         tvals = self.state.get("t_values")
         if tdim and tvals is not None and ti < len(tvals):
             try:
-                self.time_readout.setText(f"{tdim} = {tvals[ti] * 1e3:.4f} ms")
+                self._active_time_readout().setText(f"{tdim} = {tvals[ti] * 1e3:.4f} ms")
                 return
             except Exception:
                 pass
-        self.time_readout.setText(f"time index = {ti}")
+        self._active_time_readout().setText(f"time index = {ti}")
 
     def _compute_ylim_for_final(self, varname: str, tdim: Optional[str], yscale: str) -> Tuple[Optional[float], Optional[float]]:
         ys_all = []
@@ -1060,7 +1746,418 @@ class Hermes3QtMainWindow(QMainWindow):
         margin = 0.05 * (ymax - ymin) if ymax > ymin else 0.1 * abs(ymax)
         return ymin - margin, ymax + margin
 
+    # ---------- 2D plotting ----------
+    def _primary_case(self) -> Optional[_LoadedCase]:
+        if not self.cases:
+            return None
+        return next(iter(self.cases.values()))
+
+    def _ds_at_time(self, case: _LoadedCase):
+        ds = case.ds
+        tdim = self.state.get("time_dim")
+        if tdim and tdim in getattr(ds, "dims", {}):
+            try:
+                ti = self._get_time_index_for_case(case)
+                ds_t = ds.isel({tdim: ti})
+
+                # IMPORTANT: sdtools stores crucial geometry info on `ds.metadata`
+                # (a Python attribute, not xarray attrs). Slicing can drop it.
+                # Reattach metadata/options so selectors keep working.
+                try:
+                    if hasattr(ds, "metadata") and not hasattr(ds_t, "metadata"):
+                        ds_t.metadata = ds.metadata  # type: ignore[attr-defined]
+                    elif hasattr(ds, "metadata") and hasattr(ds_t, "metadata"):
+                        # Ensure derived keys like omp_a/imp_a survive.
+                        try:
+                            ds_t.metadata.update(ds.metadata)  # type: ignore[attr-defined]
+                        except Exception:
+                            ds_t.metadata = ds.metadata  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    if hasattr(ds, "options") and not hasattr(ds_t, "options"):
+                        ds_t.options = ds.options  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                # Back-fill sdtools-derived geometry keys if xHermes didn't provide them.
+                try:
+                    _ensure_sdtools_2d_metadata(ds_t)
+                except Exception:
+                    pass
+
+                return ds_t
+            except Exception:
+                # Even if time slicing fails, make sure sdtools-required geometry aliases exist.
+                try:
+                    _ensure_sdtools_2d_metadata(ds)
+                except Exception:
+                    pass
+                return ds
+        return ds
+
+    def _redraw_2d_current_tab(self) -> None:
+        idx = int(self.plot_tabs.currentIndex())
+        if idx == 0:
+            self._redraw_2d_poloidal()
+        elif idx == 1:
+            self._redraw_2d_radial()
+        elif idx == 2:
+            self._redraw_2d_polygon()
+        else:
+            self._redraw_2d_monitor()
+
+    def _redraw_2d_poloidal(self) -> None:
+        self._update_time_readout()
+        self.pol_figure.clear()
+        try:
+            self.pol_figure.set_facecolor("white")
+        except Exception:
+            pass
+
+        if not self.cases:
+            ax = self.pol_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            self.pol_canvas.draw_idle()
+            return
+
+        vars_to_plot = list(self.selected_vars)
+        if not vars_to_plot:
+            ax = self.pol_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No variables selected.", ha="center", va="center", transform=ax.transAxes)
+            self.pol_canvas.draw_idle()
+            return
+
+        region = str(self.pol_region_combo.currentText() or "outer_lower")
+        sepadd = int(self.pol_sepadd_spin.value())
+
+        # Layout similar to 1D profiles
+        n = len(vars_to_plot)
+        nrows = min(3, n)
+        ncols = int(np.ceil(n / nrows))
+        gs = self.pol_figure.add_gridspec(nrows=nrows, ncols=ncols, hspace=0.35, wspace=0.30)
+        axes = [self.pol_figure.add_subplot(gs[i % nrows, i // nrows]) for i in range(n)]
+
+        try:
+            from hermes3.selectors import get_1d_poloidal_data  # type: ignore
+        except Exception as e:
+            ax = self.pol_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, f"sdtools import error:\n{e}", ha="center", va="center", transform=ax.transAxes)
+            self.pol_canvas.draw_idle()
+            return
+
+        for ax, name in zip(axes, vars_to_plot):
+            ax.set_title(f"{name} ({region}, sepadd={sepadd})", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+            # Units (match 1D GUI behavior)
+            units = None
+            for c in self.cases.values():
+                try:
+                    if name in c.ds:
+                        units = c.ds[name].attrs.get("units", None)
+                        if units:
+                            break
+                except Exception:
+                    continue
+            ax.set_ylabel(f"({units})" if units else "")
+
+            for c in self.cases.values():
+                ds_t = self._ds_at_time(c)
+                try:
+                    df = get_1d_poloidal_data(ds_t, params=[name], region=region, sepadd=sepadd, target_first=False)
+                    x = np.asarray(df["Spar"].values)
+                    y = np.asarray(df[name].values)
+                    ax.plot(x, y, label=c.label)
+                except Exception as e:
+                    self.set_status(f"Poloidal extract failed for {name}: {e}", is_error=True)
+                    continue
+            if len(self.cases) > 1:
+                ax.legend(loc="best", fontsize=8)
+            ax.set_xlabel(r"S$_\parallel$ (m)")
+
+        self.pol_canvas.draw_idle()
+
+    def _redraw_2d_radial(self) -> None:
+        self._update_time_readout()
+        self.rad_figure.clear()
+        try:
+            self.rad_figure.set_facecolor("white")
+        except Exception:
+            pass
+
+        if not self.cases:
+            ax = self.rad_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            self.rad_canvas.draw_idle()
+            return
+
+        vars_to_plot = list(self.selected_vars)
+        if not vars_to_plot:
+            ax = self.rad_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No variables selected.", ha="center", va="center", transform=ax.transAxes)
+            self.rad_canvas.draw_idle()
+            return
+
+        region = str(self.rad_region_combo.currentText() or "omp")
+
+        n = len(vars_to_plot)
+        nrows = min(3, n)
+        ncols = int(np.ceil(n / nrows))
+        gs = self.rad_figure.add_gridspec(nrows=nrows, ncols=ncols, hspace=0.35, wspace=0.30)
+        axes = [self.rad_figure.add_subplot(gs[i % nrows, i // nrows]) for i in range(n)]
+
+        try:
+            # sdtools currently provides two implementations; the "_old" version avoids
+            # relying on an 'xr' alias being present.
+            from hermes3.selectors import get_1d_radial_data_old as get_1d_radial_data  # type: ignore
+        except Exception as e:
+            ax = self.rad_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, f"sdtools import error:\n{e}", ha="center", va="center", transform=ax.transAxes)
+            self.rad_canvas.draw_idle()
+            return
+
+        for ax, name in zip(axes, vars_to_plot):
+            ax.set_title(f"{name} ({region})", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+            # Units (match 1D GUI behavior)
+            units = None
+            for c in self.cases.values():
+                try:
+                    if name in c.ds:
+                        units = c.ds[name].attrs.get("units", None)
+                        if units:
+                            break
+                except Exception:
+                    continue
+            ax.set_ylabel(f"({units})" if units else "")
+
+            for c in self.cases.values():
+                ds_t = self._ds_at_time(c)
+                try:
+                    df = get_1d_radial_data(ds_t, params=[name], region=region, guards=False, sol=True, core=True)
+                    x = np.asarray(df["Srad"].values)
+                    y = np.asarray(df[name].values) if name in df else None
+                    if y is None:
+                        continue
+                    ax.plot(x, y, label=c.label)
+                except Exception as e:
+                    self.set_status(f"Radial extract failed for {name}: {e}", is_error=True)
+                    continue
+            if len(self.cases) > 1:
+                ax.legend(loc="best", fontsize=8)
+            ax.set_xlabel(r"$r^\prime - r_{sep}$ (m)")
+
+        self.rad_canvas.draw_idle()
+
+    def _redraw_2d_polygon(self) -> None:
+        self._update_time_readout()
+        self.poly_figure.clear()
+        try:
+            self.poly_figure.set_facecolor("white")
+        except Exception:
+            pass
+
+        case = self._primary_case()
+        if case is None:
+            ax = self.poly_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            self.poly_canvas.draw_idle()
+            return
+
+        var = str(self.poly_var_combo.currentText() or "").strip()
+        if not var:
+            ax = self.poly_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "Select a variable.", ha="center", va="center", transform=ax.transAxes)
+            self.poly_canvas.draw_idle()
+            return
+
+        ds_t = self._ds_at_time(case)
+        ax = self.poly_figure.add_subplot(1, 1, 1)
+        try:
+            data = ds_t[var]
+            # Clean guards for nicer visuals and use xbout polygon plotting
+            grid_only = bool(self.poly_grid_only_check.isChecked())
+            if grid_only:
+                data.hermesm.clean_guards().bout.polygon(
+                    ax=ax,
+                    grid_only=True,
+                    linecolor="k",
+                    linewidth=0.2,
+                    antialias=True,
+                    separatrix=False,
+                    targets=False,
+                    add_colorbar=False,
+                )
+                ax.set_title("grid", fontsize=11)
+            else:
+                data.hermesm.clean_guards().bout.polygon(
+                    ax=ax,
+                    cmap="Spectral_r",
+                    # Semi-transparent gridlines over colormap
+                    linecolor=(0, 0, 0, 0.15),
+                    linewidth=0,
+                    antialias=True,
+                    separatrix=True,
+                    separatrix_kwargs={"linewidth": 0.2, "color": "k"},
+                    targets=False,
+                    add_colorbar=True,
+                )
+                ax.set_title(f"{var}", fontsize=11)
+        except Exception as e:
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, f"2D plot failed:\n{e}", ha="center", va="center", transform=ax.transAxes)
+        self.poly_canvas.draw_idle()
+
+    def _redraw_2d_monitor(self) -> None:
+        self.mon_figure.clear()
+        try:
+            self.mon_figure.set_facecolor("white")
+        except Exception:
+            pass
+
+        case = self._primary_case()
+        if case is None:
+            ax = self.mon_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            self.mon_canvas.draw_idle()
+            return
+
+        ds = case.ds
+        tdim = self.state.get("time_dim") or "t"
+        if tdim not in getattr(ds, "coords", {}):
+            ax = self.mon_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, f"No time coordinate '{tdim}' in dataset.", ha="center", va="center", transform=ax.transAxes)
+            self.mon_canvas.draw_idle()
+            return
+
+        # Build monitor from 1D poloidal extraction (per user rule):
+        # for outer_lower SOL leg, index 0 ~ OMP and index -2 ~ target.
+        try:
+            from hermes3.selectors import get_1d_poloidal_data  # type: ignore
+        except Exception as e:
+            ax = self.mon_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, f"sdtools import error:\n{e}", ha="center", va="center", transform=ax.transAxes)
+            self.mon_canvas.draw_idle()
+            return
+
+        try:
+            t_ms = np.asarray(ds[tdim].values) * 1e3
+        except Exception:
+            t_ms = np.arange(case.n_time)
+
+        region = "outer_lower"
+        sepadd = int(self.pol_sepadd_spin.value()) if hasattr(self, "pol_sepadd_spin") else 0
+        ck = (case.label, region, sepadd)
+        cached = self._mon_cache.get(ck)
+        if cached is None:
+            Ne_omp = []
+            Te_omp = []
+            Ne_targ = []
+            Te_targ = []
+
+            def _slice_with_metadata(i: int):
+                try:
+                    ds_i = ds.isel({tdim: int(i)})
+                except Exception:
+                    ds_i = ds
+                # Reattach metadata/options and backfill geometry aliases
+                try:
+                    if hasattr(ds, "metadata"):
+                        ds_i.metadata = ds.metadata  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    if hasattr(ds, "options"):
+                        ds_i.options = ds.options  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    _ensure_sdtools_2d_metadata(ds_i)
+                except Exception:
+                    pass
+                return ds_i
+
+            for i in range(int(case.n_time)):
+                dsi = _slice_with_metadata(i)
+                try:
+                    df = get_1d_poloidal_data(dsi, params=["Ne", "Te"], region=region, sepadd=sepadd, target_first=False)
+                    Ne = np.asarray(df["Ne"].values)
+                    Te = np.asarray(df["Te"].values)
+                    # user rule: OMP is first index; target is 2nd-to-last
+                    Ne_omp.append(float(Ne[0]) if Ne.size else np.nan)
+                    Te_omp.append(float(Te[0]) if Te.size else np.nan)
+                    if Ne.size >= 2:
+                        Ne_targ.append(float(Ne[-2]))
+                        Te_targ.append(float(Te[-2]))
+                    else:
+                        Ne_targ.append(np.nan)
+                        Te_targ.append(np.nan)
+                except Exception:
+                    Ne_omp.append(np.nan)
+                    Te_omp.append(np.nan)
+                    Ne_targ.append(np.nan)
+                    Te_targ.append(np.nan)
+
+            Ne_omp = np.asarray(Ne_omp, dtype=float)
+            Te_omp = np.asarray(Te_omp, dtype=float)
+            Ne_targ = np.asarray(Ne_targ, dtype=float)
+            Te_targ = np.asarray(Te_targ, dtype=float)
+            self._mon_cache[ck] = (t_ms, Ne_omp, Te_omp, Ne_targ, Te_targ)
+            cached = self._mon_cache[ck]
+
+        t_ms, Ne_omp, Te_omp, Ne_targ, Te_targ = cached
+
+        gs = self.mon_figure.add_gridspec(nrows=2, ncols=2, hspace=0.35, wspace=0.30)
+        ax00 = self.mon_figure.add_subplot(gs[0, 0])
+        ax01 = self.mon_figure.add_subplot(gs[0, 1], sharex=ax00)
+        ax10 = self.mon_figure.add_subplot(gs[1, 0], sharex=ax00)
+        ax11 = self.mon_figure.add_subplot(gs[1, 1], sharex=ax00)
+
+        def _plot(ax, y, title):
+            ax.set_title(title, fontsize=10)
+            ax.grid(True, alpha=0.3)
+            if y is None:
+                ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
+                return
+            y = np.asarray(y, dtype=float)
+            if not np.any(np.isfinite(y)):
+                ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
+                return
+            ax.plot(t_ms[: len(y)], y, lw=1.5)
+
+        _plot(ax00, Ne_omp, r"$N_e^{omp}$")
+        _plot(ax01, Te_omp, r"$T_e^{omp}$")
+        _plot(ax10, Ne_targ, r"$N_e^{targ}$")
+        _plot(ax11, Te_targ, r"$T_e^{targ}$")
+
+        for ax in (ax10, ax11):
+            ax.set_xlabel("Time (ms)")
+
+        self.mon_figure.suptitle(f"{case.label} monitor", fontsize=12)
+        try:
+            self.mon_figure.tight_layout()
+        except Exception:
+            pass
+        self.mon_canvas.draw_idle()
+
     def redraw(self) -> None:
+        if self._mode_is_2d:
+            self._redraw_2d_current_tab()
+            return
+
         self._update_time_readout()
 
         self.figure.clear()
@@ -1205,6 +2302,8 @@ class Hermes3QtMainWindow(QMainWindow):
                         x = np.arange(int(ds.sizes.get(sdim, da1.size))) if sdim else np.arange(da1.size)
 
                     y = np.asarray(da1.values)
+                    if self._guard_replace_enabled() and y.ndim == 1 and sdim in getattr(da1, "dims", ()):
+                        x, y = _guard_replace_1d_profile_xy(x, y)
                     if mode == "log":
                         y = np.where(y > 0, y, np.nan)
                     ax.plot(x, y, label=c.label)
@@ -1363,8 +2462,8 @@ class Hermes3QtMainWindow(QMainWindow):
                 if cached is None:
                     try:
                         t_full = np.asarray(ds[tdim].values) * 1e3
-                        y_up_full = np.asarray(da.isel({sdim: upi}).values).squeeze()
-                        y_tg_full = np.asarray(da.isel({sdim: tgi}).values).squeeze()
+                        y_up_full = np.asarray(self._isel_1d_with_guard_replace(da, sdim=sdim, idx=upi).values).squeeze()
+                        y_tg_full = np.asarray(self._isel_1d_with_guard_replace(da, sdim=sdim, idx=tgi).values).squeeze()
                         self._hist_cache[ck] = (t_full, y_up_full, y_tg_full)
                         cached = self._hist_cache[ck]
                     except Exception:
