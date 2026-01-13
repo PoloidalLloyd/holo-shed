@@ -1,5 +1,5 @@
 # holo-shed
-A very basic gui for rapid Hermes-3 analysis.
+A very basic gui for rapid Hermes-3 1D and 2D analysis.
 
 ## Install
 
@@ -23,3 +23,6 @@ git submodule update --init --recursive
 ```bash
 python holo-shed.py /path/to/case_dir
 ```
+
+## Comments
+ Attempts have been made to allow for automatic dimension detection to allow for 1D and 2D analysis, however for 2D analysis the grid file must be located in the same directory. Currently 2D version only allows for one data set to be loaded at a time, although this will hopefully be changed in the future. 
