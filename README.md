@@ -3,7 +3,7 @@ A very basic gui for rapid Hermes-3 1D and 2D analysis.
 
 ## Install
 
-This repo vendors `sdtools` under `external/sdtools` (as a git submodule).
+This repo vendors [sdtools]([url](https://github.com/mikekryjak/sdtools)) under `external/sdtools` (as a git submodule).
 
 Clone with submodules:
 
