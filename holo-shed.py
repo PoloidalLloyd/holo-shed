@@ -2372,7 +2372,7 @@ class Hermes3QtMainWindow(QMainWindow):
                             break
                 except Exception:
                     continue
-            ax.set_ylabel(f"({units})" if units else "")
+            ax.set_ylabel(f"{units}" if units else "")
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"S$_\parallel$ (m)")
@@ -2537,7 +2537,7 @@ class Hermes3QtMainWindow(QMainWindow):
                             break
                 except Exception:
                     continue
-            ax.set_ylabel(f"({units})" if units else "")
+            ax.set_ylabel(f"{units}" if units else "")
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"$r^\prime - r_{sep}$ (m)")
@@ -2996,7 +2996,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 pass
 
             ax.set_title(name, fontsize=10)
-            ax.set_ylabel(f"({units})" if units else "")
+            ax.set_ylabel(f"{units}" if units else "")
             ax.grid(True, which="both", alpha=0.3)
             if len(self.cases) > 1:
                 ax.legend(loc="upper left", fontsize=9)

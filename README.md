@@ -23,13 +23,13 @@ git submodule update --init --recursive
 Install requirements:
 
 ```bash
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 ## Run
 
 ```bash
-python holo-shed.py /path/to/case_dir
+python3 holo-shed.py /path/to/case_dir
 ```
 
 ## Comments
