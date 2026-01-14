@@ -518,6 +518,7 @@ try:
         QApplication,
         QCheckBox,
         QComboBox,
+        QDoubleSpinBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -550,6 +551,7 @@ except Exception:  # pragma: no cover
         QApplication,
         QCheckBox,
         QComboBox,
+        QDoubleSpinBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -858,6 +860,7 @@ class Hermes3QtMainWindow(QMainWindow):
         time2d_layout.setContentsMargins(0, 0, 0, 0)
         time2d_layout.setSpacing(4)
         time2d_layout.addWidget(QLabel("2D time index"))
+
         time2d_row = QHBoxLayout()
         self.time_slider_2d = QSlider(Qt.Orientation.Horizontal)
         self.time_slider_2d.setMinimum(0)
@@ -870,9 +873,34 @@ class Hermes3QtMainWindow(QMainWindow):
             self.time_slider_2d.setTracking(True)
         except Exception:
             pass
-        self.time_readout_2d = QLabel("time index = 0")
         time2d_row.addWidget(self.time_slider_2d, 1)
-        time2d_row.addWidget(self.time_readout_2d)
+
+        # Controls to the right of the slider (replacing the old readout label)
+        time2d_row.addWidget(QLabel("idx"))
+        self.time_spin_2d = QSpinBox()
+        self.time_spin_2d.setRange(0, 0)
+        self.time_spin_2d.setValue(0)
+        try:
+            # Don't emit while user types, only when value is committed/stepped
+            self.time_spin_2d.setKeyboardTracking(False)
+        except Exception:
+            pass
+        time2d_row.addWidget(self.time_spin_2d)
+
+        time2d_row.addWidget(QLabel("t [ms]"))
+        self.time_ms_spin_2d = QDoubleSpinBox()
+        self.time_ms_spin_2d.setDecimals(4)
+        self.time_ms_spin_2d.setSingleStep(0.1)
+        self.time_ms_spin_2d.setRange(0.0, 1.0e12)
+        self.time_ms_spin_2d.setValue(0.0)
+        try:
+            self.time_ms_spin_2d.setKeyboardTracking(False)
+        except Exception:
+            pass
+        time2d_row.addWidget(self.time_ms_spin_2d)
+
+        # Keep the old label for backwards compatibility (not shown)
+        self.time_readout_2d = QLabel("time index = 0")
         time2d_layout.addLayout(time2d_row)
         self.time2d_widget.setVisible(False)
         left_layout.addWidget(self.time2d_widget)
@@ -1041,11 +1069,34 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_slider.setSingleStep(1)
         self.time_slider.setPageStep(1)
         self.time_slider.setValue(0)
+        slider_row.addWidget(self.time_slider, 1)
+
+        # Controls to the right of the slider (replacing the old readout label)
+        slider_row.addWidget(QLabel("idx"))
+        self.time_spin = QSpinBox()
+        self.time_spin.setRange(0, 0)
+        self.time_spin.setValue(0)
+        try:
+            self.time_spin.setKeyboardTracking(False)
+        except Exception:
+            pass
+        slider_row.addWidget(self.time_spin)
+
+        slider_row.addWidget(QLabel("t [ms]"))
+        self.time_ms_spin = QDoubleSpinBox()
+        self.time_ms_spin.setDecimals(4)
+        self.time_ms_spin.setSingleStep(0.1)
+        self.time_ms_spin.setRange(0.0, 1.0e12)
+        self.time_ms_spin.setValue(0.0)
+        try:
+            self.time_ms_spin.setKeyboardTracking(False)
+        except Exception:
+            pass
+        slider_row.addWidget(self.time_ms_spin)
+
+        # Keep old widgets for backwards compatibility (not shown)
         self.time_readout = QLabel("time index = 0")
         self._time_index_label_1d = QLabel("time index")
-        slider_row.addWidget(self._time_index_label_1d)
-        slider_row.addWidget(self.time_slider, 1)
-        slider_row.addWidget(self.time_readout)
         prof_plot_layout.addLayout(slider_row)
 
         hist_plot_tab = QWidget()
@@ -1127,11 +1178,15 @@ class Hermes3QtMainWindow(QMainWindow):
         self.vars_list.itemChanged.connect(self._on_var_item_changed)
         self.vars_list.itemDoubleClicked.connect(self._on_var_item_double_clicked)
         self.vars_list.customContextMenuRequested.connect(self._on_var_list_context_menu)
-        self.time_slider.valueChanged.connect(lambda _v: self.request_redraw())
+        self.time_slider.valueChanged.connect(self._on_time_slider_1d_changed)
         self.time_slider_2d.valueChanged.connect(self._on_time_slider_2d_changed)
         self.time_slider_2d.sliderMoved.connect(lambda v: self._set_time_readout_for_index(int(v)))
         self.time_slider_2d.sliderPressed.connect(lambda: self._set_time2d_dragging(True))
         self.time_slider_2d.sliderReleased.connect(lambda: self._set_time2d_dragging(False, redraw=True))
+        self.time_spin.valueChanged.connect(self._on_time_spin_1d_changed)
+        self.time_spin_2d.valueChanged.connect(self._on_time_spin_2d_changed)
+        self.time_ms_spin.valueChanged.connect(self._on_time_ms_spin_1d_changed)
+        self.time_ms_spin_2d.valueChanged.connect(self._on_time_ms_spin_2d_changed)
         self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
         self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
@@ -1200,7 +1255,13 @@ class Hermes3QtMainWindow(QMainWindow):
                 self.time2d_widget.setVisible(True)
             except Exception:
                 pass
-            for w in (getattr(self, "_time_index_label_1d", None), getattr(self, "time_slider", None), getattr(self, "time_readout", None)):
+            for w in (
+                getattr(self, "_time_index_label_1d", None),
+                getattr(self, "time_spin", None),
+                getattr(self, "time_ms_spin", None),
+                getattr(self, "time_slider", None),
+                getattr(self, "time_readout", None),
+            ):
                 try:
                     if w is not None:
                         w.setVisible(False)
@@ -1222,7 +1283,13 @@ class Hermes3QtMainWindow(QMainWindow):
                 self.time2d_widget.setVisible(False)
             except Exception:
                 pass
-            for w in (getattr(self, "_time_index_label_1d", None), getattr(self, "time_slider", None), getattr(self, "time_readout", None)):
+            for w in (
+                getattr(self, "_time_index_label_1d", None),
+                getattr(self, "time_spin", None),
+                getattr(self, "time_ms_spin", None),
+                getattr(self, "time_slider", None),
+                getattr(self, "time_readout", None),
+            ):
                 try:
                     if w is not None:
                         w.setVisible(True)
@@ -1240,6 +1307,129 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _active_time_readout(self) -> "QLabel":
         return self.time_readout_2d if self._mode_is_2d else self.time_readout
+
+    def _active_time_spin(self) -> "QSpinBox":
+        return self.time_spin_2d if self._mode_is_2d else self.time_spin
+
+    def _active_time_ms_spin(self) -> "QDoubleSpinBox":
+        return self.time_ms_spin_2d if self._mode_is_2d else self.time_ms_spin
+
+    def _t_values_ms(self) -> Optional[np.ndarray]:
+        tvals = self.state.get("t_values")
+        if tvals is None:
+            return None
+        try:
+            arr = np.asarray(tvals, dtype=float) * 1e3  # stored in seconds, display in ms
+            arr = arr[np.isfinite(arr)]
+            return arr if arr.size else None
+        except Exception:
+            return None
+
+    def _nearest_time_index_for_ms(self, t_ms: float) -> Optional[int]:
+        tvals = self.state.get("t_values")
+        if tvals is None:
+            return None
+        try:
+            arr = np.asarray(tvals, dtype=float) * 1e3
+            if arr.size == 0:
+                return None
+            # Use finite values for distance; map back to original indices
+            finite_mask = np.isfinite(arr)
+            if not np.any(finite_mask):
+                return None
+            idxs = np.nonzero(finite_mask)[0]
+            arr_f = arr[finite_mask]
+            j = int(np.argmin(np.abs(arr_f - float(t_ms))))
+            return int(idxs[j])
+        except Exception:
+            return None
+
+    def _set_time_ms_spin_for_index(self, ti: int) -> None:
+        tvals = self.state.get("t_values")
+        if tvals is None:
+            try:
+                self._active_time_ms_spin().setEnabled(False)
+            except Exception:
+                pass
+            return
+        try:
+            tvals = np.asarray(tvals, dtype=float)
+            if ti < 0 or ti >= tvals.size or not np.isfinite(tvals[ti]):
+                return
+            ms = float(tvals[ti]) * 1e3
+            spin = self._active_time_ms_spin()
+            spin.setEnabled(True)
+            spin.blockSignals(True)
+            spin.setValue(ms)
+        finally:
+            try:
+                self._active_time_ms_spin().blockSignals(False)
+            except Exception:
+                pass
+
+    def _set_time_spin_for_index(self, ti: int) -> None:
+        try:
+            spin = self._active_time_spin()
+            spin.blockSignals(True)
+            spin.setValue(int(ti))
+        finally:
+            try:
+                spin.blockSignals(False)
+            except Exception:
+                pass
+
+    def _on_time_spin_1d_changed(self, v: int) -> None:
+        # Jump to index via numeric input (1D)
+        try:
+            self.time_slider.setValue(int(v))
+        except Exception:
+            pass
+        self.request_redraw()
+
+    def _on_time_spin_2d_changed(self, v: int) -> None:
+        # Jump to index via numeric input (2D)
+        try:
+            self.time_slider_2d.setValue(int(v))
+        except Exception:
+            pass
+        # 2D redraw can be heavy; this is an intentional action so redraw immediately
+        self.request_redraw()
+
+    def _on_time_ms_spin_1d_changed(self, v: float) -> None:
+        ti = self._nearest_time_index_for_ms(float(v))
+        if ti is None:
+            return
+        try:
+            self.time_slider.setValue(int(ti))
+        except Exception:
+            pass
+        self.request_redraw()
+
+    def _on_time_ms_spin_2d_changed(self, v: float) -> None:
+        ti = self._nearest_time_index_for_ms(float(v))
+        if ti is None:
+            return
+        try:
+            self.time_slider_2d.setValue(int(ti))
+        except Exception:
+            pass
+        self.request_redraw()
+
+    def _on_time_slider_1d_changed(self, v: int) -> None:
+        # Keep numeric input synced with slider
+        try:
+            self.time_spin.blockSignals(True)
+            self.time_spin.setValue(int(v))
+        finally:
+            try:
+                self.time_spin.blockSignals(False)
+            except Exception:
+                pass
+        try:
+            self._set_time_ms_spin_for_index(int(v))
+        except Exception:
+            pass
+        self.request_redraw()
 
     # ---------- Status / datasets ----------
     def set_status(self, msg: str, *, is_error: bool = False) -> None:
@@ -1998,7 +2188,10 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _set_time_range(self, n_t: int) -> None:
         n_t = max(1, int(n_t))
-        for slider in (getattr(self, "time_slider", None), getattr(self, "time_slider_2d", None)):
+        for slider, spin in (
+            (getattr(self, "time_slider", None), getattr(self, "time_spin", None)),
+            (getattr(self, "time_slider_2d", None), getattr(self, "time_spin_2d", None)),
+        ):
             if slider is None:
                 continue
             slider.blockSignals(True)
@@ -2009,6 +2202,38 @@ class Hermes3QtMainWindow(QMainWindow):
                 slider.setValue(n_t - 1)
             finally:
                 slider.blockSignals(False)
+            if spin is not None:
+                try:
+                    spin.blockSignals(True)
+                    spin.setRange(0, max(0, n_t - 1))
+                    spin.setValue(n_t - 1)
+                finally:
+                    try:
+                        spin.blockSignals(False)
+                    except Exception:
+                        pass
+
+        # Update ms spin ranges (if time coordinate available)
+        tms = self._t_values_ms()
+        for ms_spin in (getattr(self, "time_ms_spin", None), getattr(self, "time_ms_spin_2d", None)):
+            if ms_spin is None:
+                continue
+            if tms is None:
+                try:
+                    ms_spin.setEnabled(False)
+                except Exception:
+                    pass
+                continue
+            try:
+                ms_spin.setEnabled(True)
+                ms_spin.blockSignals(True)
+                ms_spin.setRange(float(np.nanmin(tms)), float(np.nanmax(tms)))
+                ms_spin.setValue(float(tms[-1]))
+            finally:
+                try:
+                    ms_spin.blockSignals(False)
+                except Exception:
+                    pass
 
     def _update_after_load(self) -> None:
         vars_, sdim, tdim = self._recompute_all_vars()
@@ -2166,6 +2391,14 @@ class Hermes3QtMainWindow(QMainWindow):
         """
         Update the active time readout label for an arbitrary index (used for 2D slider dragging).
         """
+        try:
+            self._set_time_spin_for_index(int(ti))
+        except Exception:
+            pass
+        try:
+            self._set_time_ms_spin_for_index(int(ti))
+        except Exception:
+            pass
         # Prefer the active slider's range for a stable "idx/Max" display
         try:
             tmax = int(self._active_time_slider().maximum())
