@@ -685,6 +685,9 @@ class Hermes3QtMainWindow(QMainWindow):
         self._rad_cache: Dict[tuple, object] = {}
         self._profile_max_points = 2500
         self._fast_slider_step = 10  # Shift+Arrow moves by this many indices
+        # 2D polygon colorbar limits are only applied when user confirms
+        self._poly_vmin_active: Optional[float] = None
+        self._poly_vmax_active: Optional[float] = None
 
         # 2D time-slider redraw throttle (keeps dragging responsive)
         self._time2d_redraw_timer = QTimer(self)
@@ -954,6 +957,12 @@ class Hermes3QtMainWindow(QMainWindow):
         self.poly_vmax_edit.setPlaceholderText("auto")
         clim_row.addWidget(self.poly_vmax_edit, 1)
         poly_ctrl_layout.addLayout(clim_row)
+
+        apply_row = QHBoxLayout()
+        self.poly_apply_clim_btn = QPushButton("Apply cbar limits")
+        apply_row.addWidget(self.poly_apply_clim_btn)
+        apply_row.addStretch(1)
+        poly_ctrl_layout.addLayout(apply_row)
         poly_ctrl_layout.addStretch(1)
 
         self._mon_ctrl_tab = QWidget()
@@ -1088,8 +1097,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_grid_only_check.toggled.connect(lambda _v: self.request_redraw())
         self.poly_log_check.toggled.connect(lambda _v: self.request_redraw())
-        self.poly_vmin_edit.editingFinished.connect(lambda: self.request_redraw())
-        self.poly_vmax_edit.editingFinished.connect(lambda: self.request_redraw())
+        self.poly_apply_clim_btn.clicked.connect(self._apply_poly_clim)
         self.guard_replace_check.toggled.connect(lambda _v: self.request_redraw())
         self.guard_replace_check.toggled.connect(lambda _v: self.request_time_history_redraw())
         self.hist_upstream_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
@@ -1510,6 +1518,14 @@ class Hermes3QtMainWindow(QMainWindow):
             except Exception:
                 pass
             self.request_redraw()
+
+    def _apply_poly_clim(self) -> None:
+        """
+        Apply 2D field colorbar limits from the text boxes.
+        """
+        self._poly_vmin_active = _parse_optional_float(self.poly_vmin_edit.text())
+        self._poly_vmax_active = _parse_optional_float(self.poly_vmax_edit.text())
+        self.request_redraw()
 
     def _clear_overlay_buttons(self) -> None:
         for ylim_btn, yscale_btn in list(self._overlay_buttons.values()):
@@ -2635,10 +2651,10 @@ class Hermes3QtMainWindow(QMainWindow):
                     targets=False,
                     add_colorbar=False,
                 )
-                ax.set_title("grid", fontsize=11)
+                ax.set_title("Computational grid", fontsize=11)
             else:
-                vmin = _parse_optional_float(self.poly_vmin_edit.text())
-                vmax = _parse_optional_float(self.poly_vmax_edit.text())
+                vmin = self._poly_vmin_active
+                vmax = self._poly_vmax_active
                 logscale = False
                 try:
                     logscale = bool(self.poly_log_check.isChecked())
