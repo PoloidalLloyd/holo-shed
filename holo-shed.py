@@ -1270,9 +1270,8 @@ class Hermes3QtMainWindow(QMainWindow):
         return [v for v in vars_all if q in v.lower()]
 
     def _item_text_for_var(self, name: str) -> str:
-        ymode = self._yscale_by_var.get(name, "linear")
-        ylim = self._ylim_mode_by_var.get(name, "auto")
-        return f"{name}   [y:{ymode}, ylim:{ylim}]"
+        # Keep variable list clean; controls live on plots / context menu.
+        return str(name)
 
     def _render_var_list(self) -> None:
         self.vars_list.blockSignals(True)
