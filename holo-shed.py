@@ -131,6 +131,48 @@ def _selector_params_only(vars_to_plot: List[str]) -> List[str]:
     return [v for v in vars_to_plot if v not in geom]
 
 
+def _xpoint_idx_bpxy_valley(bp: np.ndarray) -> Optional[int]:
+    """
+    Heuristic X-point index from a 1D Bpxy trace along the field line.
+
+    We walk from the start and keep updating the minimum |Bpxy| until the signal
+    has started rising again for a few consecutive points. This avoids picking the
+    target-side low-field region after the X-point.
+    """
+    a = np.asarray(bp, dtype=float)
+    m = np.isfinite(a)
+    if not np.any(m):
+        return None
+    a = np.abs(a[m])
+    if a.size < 3:
+        return int(np.argmin(a))
+
+    best_i = 0
+    best = float(a[0])
+    rise = 0
+    # how many consecutive rises indicate we're past the minimum
+    rise_needed = 3
+    eps = 0.0
+
+    prev = float(a[0])
+    for i in range(1, int(a.size)):
+        cur = float(a[i])
+        if cur < best:
+            best = cur
+            best_i = i
+            rise = 0
+        # Rising after we have a minimum
+        if i > best_i:
+            if cur > prev + eps:
+                rise += 1
+            else:
+                rise = 0
+            if rise >= rise_needed and (i - best_i) >= 2:
+                break
+        prev = cur
+    return int(best_i)
+
+
 def _guard_replace_1d_profile_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Guard-replace for *profiles* (x,y arrays).
@@ -601,6 +643,28 @@ except Exception:  # pragma: no cover
         return Qt.Unchecked
 
 
+class _RegionOverlayWindow(QMainWindow):
+    """
+    Small pop-out window used for showing an R-Z cut overlay on a 2D colormap.
+    """
+
+    def __init__(self, title: str, *, on_close=None):
+        super().__init__()
+        self._on_close = on_close
+        try:
+            self.setWindowTitle(title)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):  # type: ignore[override]
+        try:
+            if callable(self._on_close):
+                self._on_close()
+        except Exception:
+            pass
+        return super().closeEvent(event)
+
+
 def _apply_mpl_light_theme() -> None:
     """
     Force Matplotlib to a light theme (white backgrounds / dark text).
@@ -760,6 +824,9 @@ class Hermes3QtMainWindow(QMainWindow):
         self._poly_ax = None
         self._poly_polys = None
         self._poly_cbar = None
+        # Optional popout windows showing cut location on 2D colormap
+        self._region2d_pol = None
+        self._region2d_rad = None
 
         # 2D time-slider redraw throttle (keeps dragging responsive)
         self._time2d_redraw_timer = QTimer(self)
@@ -1007,6 +1074,21 @@ class Hermes3QtMainWindow(QMainWindow):
         self.pol_use_spol_check = QCheckBox("Plot vs Spol (instead of Spar)")
         self.pol_use_spol_check.setChecked(False)
         pol_ctrl_layout.addWidget(self.pol_use_spol_check)
+
+        pol_xpt_row = QHBoxLayout()
+        pol_xpt_row.addWidget(QLabel("X-point method"))
+        self.pol_xpoint_combo = QComboBox()
+        self.pol_xpoint_combo.addItems(["Bxy extrema", "Bpxy valley", "min R"])
+        try:
+            self.pol_xpoint_combo.setCurrentIndex(0)  # default
+        except Exception:
+            pass
+        pol_xpt_row.addWidget(self.pol_xpoint_combo, 1)
+        pol_ctrl_layout.addLayout(pol_xpt_row)
+
+        self.pol_show_region2d_check = QCheckBox("Show region in 2D")
+        self.pol_show_region2d_check.setChecked(False)
+        pol_ctrl_layout.addWidget(self.pol_show_region2d_check)
         pol_ctrl_layout.addStretch(1)
 
         self._rad_ctrl_tab = QWidget()
@@ -1029,6 +1111,10 @@ class Hermes3QtMainWindow(QMainWindow):
         )
         rad_region_row.addWidget(self.rad_region_combo, 1)
         rad_ctrl_layout.addLayout(rad_region_row)
+
+        self.rad_show_region2d_check = QCheckBox("Show region in 2D")
+        self.rad_show_region2d_check.setChecked(False)
+        rad_ctrl_layout.addWidget(self.rad_show_region2d_check)
         rad_ctrl_layout.addStretch(1)
 
         self._poly_ctrl_tab = QWidget()
@@ -1226,7 +1312,10 @@ class Hermes3QtMainWindow(QMainWindow):
         self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
         self.pol_use_spol_check.toggled.connect(lambda _v: self.request_redraw())
+        self.pol_xpoint_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
+        self.pol_show_region2d_check.toggled.connect(self._on_pol_show_region2d_toggled)
         self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
+        self.rad_show_region2d_check.toggled.connect(self._on_rad_show_region2d_toggled)
         self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_grid_only_check.toggled.connect(lambda _v: self.request_redraw())
         self.poly_log_check.toggled.connect(lambda _v: self.request_redraw())
@@ -1304,6 +1393,12 @@ class Hermes3QtMainWindow(QMainWindow):
                     pass
         else:
             self.setWindowTitle(f"Hermes-3 GUI (1D) - Qt ({_QT_API})")
+            # Leaving 2D mode -> close any region-overlay popouts
+            try:
+                self._close_region2d_window("pol")
+                self._close_region2d_window("rad")
+            except Exception:
+                pass
             try:
                 self.add_btn.setEnabled(True)
             except Exception:
@@ -2538,14 +2633,14 @@ class Hermes3QtMainWindow(QMainWindow):
         if not last:
             return None
         try:
+            # Both pol and rad state tuples are of the form:
+            #   (kind, label, ti, ...rest...)
+            # We strip ti generically so adding new fields doesn't break zoom-preserve.
+            last_no_ti = (last[0], last[1], *last[3:])
             if kind == "pol":
-                # ("pol", label, ti, region, sepadd, vars_to_plot, modes)
-                last_no_ti = ("pol", last[1], last[3], last[4], last[5], last[6])
                 axes_map = self._overlay_axes_by_var_pol
                 fig_axes = set(getattr(self.pol_figure, "axes", []))
             else:
-                # ("rad", label, ti, region, vars_to_plot, modes)
-                last_no_ti = ("rad", last[1], last[3], last[4], last[5])
                 axes_map = self._overlay_axes_by_var_rad
                 fig_axes = set(getattr(self.rad_figure, "axes", []))
         except Exception:
@@ -2612,6 +2707,305 @@ class Hermes3QtMainWindow(QMainWindow):
                 pass
         except Exception:
             pass
+
+    def _close_region2d_window(self, kind: str) -> None:
+        st = self._region2d_pol if kind == "pol" else self._region2d_rad
+        if not st:
+            return
+        try:
+            win = st.get("win")
+            if win is not None:
+                win.close()
+        except Exception:
+            pass
+        if kind == "pol":
+            self._region2d_pol = None
+        else:
+            self._region2d_rad = None
+
+    def _ensure_region2d_window(self, kind: str):
+        if kind == "pol" and self._region2d_pol:
+            return self._region2d_pol
+        if kind == "rad" and self._region2d_rad:
+            return self._region2d_rad
+
+        def _on_close():
+            # If user closes the window manually, untoggle the checkbox
+            try:
+                if kind == "pol" and hasattr(self, "pol_show_region2d_check"):
+                    self.pol_show_region2d_check.blockSignals(True)
+                    self.pol_show_region2d_check.setChecked(False)
+                    self.pol_show_region2d_check.blockSignals(False)
+                if kind == "rad" and hasattr(self, "rad_show_region2d_check"):
+                    self.rad_show_region2d_check.blockSignals(True)
+                    self.rad_show_region2d_check.setChecked(False)
+                    self.rad_show_region2d_check.blockSignals(False)
+            except Exception:
+                pass
+            if kind == "pol":
+                self._region2d_pol = None
+            else:
+                self._region2d_rad = None
+
+        title = "Show cut in 2D: Poloidal" if kind == "pol" else "Show cut in 2D: Radial"
+        win = _RegionOverlayWindow(title, on_close=_on_close)
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        fig = Figure(figsize=(7.5, 6.0))
+        canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(canvas, win)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, 1)
+        win.setCentralWidget(central)
+
+        st = {"win": win, "fig": fig, "canvas": canvas, "toolbar": toolbar, "ax": None, "polys": None, "line": None, "arrow": None, "state": None}
+        if kind == "pol":
+            self._region2d_pol = st
+        else:
+            self._region2d_rad = st
+        try:
+            win.resize(900, 700)
+        except Exception:
+            pass
+        try:
+            win.show()
+        except Exception:
+            pass
+        return st
+
+    def _get_region2d_state(self):
+        case = self._primary_case()
+        if case is None:
+            return None, None, None
+        ds_t = self._ds_at_time(case)
+        var = str(getattr(self, "poly_var_combo", None).currentText() or "").strip() if hasattr(self, "poly_var_combo") else ""
+        if not var:
+            var = "Te" if ("Te" in ds_t) else (next(iter(ds_t.data_vars.keys())) if getattr(ds_t, "data_vars", {}) else "")
+        if not var or var not in ds_t:
+            return case, ds_t, None
+        logscale = bool(getattr(self, "poly_log_check", None).isChecked()) if hasattr(self, "poly_log_check") else False
+        vmin = self._poly_vmin_active
+        vmax = self._poly_vmax_active
+        return case, ds_t, (var, logscale, vmin, vmax)
+
+    def _update_region2d_overlay(self, kind: str) -> None:
+        """
+        Update the optional popout window showing the cut location over a 2D colormap.
+        """
+        st = self._region2d_pol if kind == "pol" else self._region2d_rad
+        if not st:
+            return
+        case, ds_t, bg = self._get_region2d_state()
+        fig = st.get("fig")
+        canvas = st.get("canvas")
+        if case is None or ds_t is None or bg is None or fig is None or canvas is None:
+            return
+
+        var, logscale, vmin, vmax = bg
+        state_key = (case.label, var, bool(logscale), vmin, vmax)
+
+        rebuild = (st.get("state") != state_key) or (st.get("ax") is None) or (st.get("polys") is None) or (st.get("line") is None)
+
+        if rebuild:
+            fig.clear()
+            try:
+                fig.set_facecolor("white")
+            except Exception:
+                pass
+            ax = fig.add_subplot(1, 1, 1)
+            st["ax"] = ax
+            st["polys"] = None
+            st["line"] = None
+            st["arrow"] = None
+            st["state"] = state_key
+            try:
+                data = ds_t[var]
+                data.hermesm.clean_guards().bout.polygon(
+                    ax=ax,
+                    cmap="Spectral_r",
+                    linecolor=(0, 0, 0, 0.10),
+                    linewidth=0.0,
+                    antialias=False,
+                    logscale=bool(logscale),
+                    vmin=vmin,
+                    vmax=vmax,
+                    separatrix=True,
+                    separatrix_kwargs={"linewidth": 0.6, "color": "k"},
+                    targets=False,
+                    add_colorbar=False,
+                )
+                st["polys"] = ax.collections[-1] if ax.collections else None
+            except Exception as e:
+                ax.set_axis_off()
+                ax.text(0.5, 0.5, f"2D background failed:\n{e}", ha="center", va="center", transform=ax.transAxes)
+            try:
+                (ln,) = ax.plot([], [], color="red", linewidth=2.0, linestyle="--", alpha=0.7)
+                ln.set_zorder(10)
+                st["line"] = ln
+            except Exception:
+                st["line"] = None
+            try:
+                self._reset_toolbar_home(st.get("toolbar"))
+            except Exception:
+                pass
+        else:
+            # Fast update for time changes: update polygon colors only
+            try:
+                polys = st.get("polys")
+                if polys is not None:
+                    data = ds_t[var].hermesm.clean_guards()
+                    polys.set_array(np.asarray(data.data).flatten())
+            except Exception:
+                pass
+
+        ax = st.get("ax")
+        ln = st.get("line")
+        if ax is None or ln is None:
+            canvas.draw_idle()
+            return
+
+        # Determine cut R,Z
+        try:
+            if kind == "pol":
+                region = str(self.pol_region_combo.currentText() or "outer_lower")
+                sepadd = int(self.pol_sepadd_spin.value())
+                ti = self._get_time_index_for_case(case)
+                ck = (case.label, ti, region, sepadd)
+                df = self._pol_cache.get(ck)
+                if df is None:
+                    from hermes3.selectors import get_1d_poloidal_data  # type: ignore
+
+                    df = get_1d_poloidal_data(ds_t, params=[], region=region, sepadd=sepadd, target_first=False)
+                    self._pol_cache[ck] = df
+            else:
+                region = str(self.rad_region_combo.currentText() or "omp")
+                ti = self._get_time_index_for_case(case)
+                ck = (case.label, ti, region)
+                df = self._rad_cache.get(ck)
+                if df is None:
+                    try:
+                        import xarray as xr  # type: ignore
+                        import hermes3.selectors as _sel  # type: ignore
+
+                        setattr(_sel, "xr", xr)
+                        get_1d_radial_data = _sel.get_1d_radial_data  # type: ignore[attr-defined]
+                    except Exception:
+                        from hermes3.selectors import get_1d_radial_data_old as get_1d_radial_data  # type: ignore
+                    # Need R/Z in the output to draw the overlay. The selector does not
+                    # include these unless explicitly requested.
+                    df = get_1d_radial_data(ds_t, params=["R", "Z"], region=region, guards=False, sol=True, core=True)
+                    self._rad_cache[ck] = df
+            if df is None or ("R" not in df) or ("Z" not in df):
+                raise KeyError("No R/Z columns in extracted cut data.")
+            R0 = np.asarray(df["R"].values, dtype=float)
+            Z0 = np.asarray(df["Z"].values, dtype=float)
+            # Coordinate used to define "increasing direction" along the cut
+            if kind == "pol":
+                try:
+                    use_spol = bool(self.pol_use_spol_check.isChecked())
+                except Exception:
+                    use_spol = False
+                ccol = "Spol" if use_spol else "Spar"
+            else:
+                ccol = "Srad"
+            c0 = np.asarray(df[ccol].values, dtype=float) if ccol in df else None
+
+            m = np.isfinite(R0) & np.isfinite(Z0)
+            if c0 is not None:
+                m = m & np.isfinite(c0)
+            R = R0[m]
+            Z = Z0[m]
+            cc = c0[m] if c0 is not None else None
+            ln.set_data(R, Z)
+
+            # Update direction arrow (at end of increasing coordinate)
+            try:
+                arr = st.get("arrow")
+                if arr is not None:
+                    arr.remove()
+            except Exception:
+                pass
+            st["arrow"] = None
+            if cc is not None and R.size >= 2:
+                try:
+                    order = np.argsort(cc)
+                    end_i = int(order[-1])
+                    prev_i = int(order[-2])
+                    # ensure the arrow has non-zero length
+                    k = 2
+                    while k <= order.size and (R[end_i] == R[prev_i] and Z[end_i] == Z[prev_i]):
+                        prev_i = int(order[-k])
+                        k += 1
+                    arrow = ax.annotate(
+                        "",
+                        xy=(float(R[end_i]), float(Z[end_i])),
+                        xytext=(float(R[prev_i]), float(Z[prev_i])),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            color=getattr(ln, "get_color", lambda: "k")(),
+                            lw=2.0,
+                            alpha=0.7,
+                        ),
+                    )
+                    try:
+                        arrow.set_zorder(11)
+                    except Exception:
+                        pass
+                    st["arrow"] = arrow
+                except Exception:
+                    pass
+        except Exception as e:
+            # No cut available -> clear line
+            try:
+                ln.set_data([], [])
+            except Exception:
+                pass
+            try:
+                arr = st.get("arrow")
+                if arr is not None:
+                    arr.remove()
+            except Exception:
+                pass
+            st["arrow"] = None
+            try:
+                ax.text(0.02, 0.02, f"Cut overlay unavailable: {e}", transform=ax.transAxes, fontsize=9)
+            except Exception:
+                pass
+
+        canvas.draw_idle()
+
+    def _on_pol_show_region2d_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._close_region2d_window("pol")
+            return
+        # Only valid in 2D mode
+        if not getattr(self, "_mode_is_2d", False):
+            try:
+                self.pol_show_region2d_check.blockSignals(True)
+                self.pol_show_region2d_check.setChecked(False)
+                self.pol_show_region2d_check.blockSignals(False)
+            except Exception:
+                pass
+            return
+        self._ensure_region2d_window("pol")
+        self._update_region2d_overlay("pol")
+
+    def _on_rad_show_region2d_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._close_region2d_window("rad")
+            return
+        if not getattr(self, "_mode_is_2d", False):
+            try:
+                self.rad_show_region2d_check.blockSignals(True)
+                self.rad_show_region2d_check.setChecked(False)
+                self.rad_show_region2d_check.blockSignals(False)
+            except Exception:
+                pass
+            return
+        self._ensure_region2d_window("rad")
+        self._update_region2d_overlay("rad")
 
     def _maybe_capture_view_1d(self, *, state_key_no_ti: tuple) -> Optional[Dict[str, tuple]]:
         """
@@ -2926,9 +3320,10 @@ class Hermes3QtMainWindow(QMainWindow):
             region = str(self.pol_region_combo.currentText() or "outer_lower")
             sepadd = int(self.pol_sepadd_spin.value())
             use_spol = bool(getattr(self, "pol_use_spol_check", None).isChecked()) if hasattr(self, "pol_use_spol_check") else False
+            xpt_mode = str(getattr(self, "pol_xpoint_combo", None).currentText() or "Bpxy valley") if hasattr(self, "pol_xpoint_combo") else "Bpxy valley"
             vars_to_plot = tuple(self.selected_vars)
             modes = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
-            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, use_spol, vars_to_plot, modes)
+            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, use_spol, xpt_mode, vars_to_plot, modes)
             if self._last_draw_state_2d.get("pol") == state_key and self.pol_figure.axes:
                 try:
                     self._position_overlay_buttons_pol()
@@ -2937,7 +3332,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 self.pol_canvas.draw_idle()
                 return
             # Preserve zoom/pan across time changes (same config, different ti)
-            state_no_ti = ("pol", getattr(case, "label", None), region, sepadd, use_spol, vars_to_plot, modes)
+            state_no_ti = ("pol", getattr(case, "label", None), region, sepadd, use_spol, xpt_mode, vars_to_plot, modes)
             _view_restore = self._maybe_capture_view_2d(kind="pol", state_key_no_ti=state_no_ti)
             self._last_draw_state_2d["pol"] = state_key
         except Exception:
@@ -2967,6 +3362,7 @@ class Hermes3QtMainWindow(QMainWindow):
         region = str(self.pol_region_combo.currentText() or "outer_lower")
         sepadd = int(self.pol_sepadd_spin.value())
         use_spol = bool(getattr(self, "pol_use_spol_check", None).isChecked()) if hasattr(self, "pol_use_spol_check") else False
+        xpt_mode = str(getattr(self, "pol_xpoint_combo", None).currentText() or "Bpxy valley") if hasattr(self, "pol_xpoint_combo") else "Bpxy valley"
         xcol = "Spol" if use_spol else "Spar"
         xlab = (r"S$_{pol}$ (m)" if use_spol else r"S$_\parallel$ (m)")
 
@@ -2988,7 +3384,6 @@ class Hermes3QtMainWindow(QMainWindow):
             return
 
         # Reference: mark the X-point location along the field line.
-        # Use minimum |Bpxy| along the selected region/sepadd (robust for both inner/outer).
         xline_rmin = None
         try:
             c0 = self._primary_case()
@@ -3004,7 +3399,7 @@ class Hermes3QtMainWindow(QMainWindow):
                     except Exception:
                         df0 = None
                     self._pol_cache[ck0] = df0
-                # Ensure Bpxy exists in the cached df (incremental add)
+                # Ensure Bpxy/Bxy exist in the cached df (incremental add)
                 if df0 is not None:
                     try:
                         need_bpxy = "Bpxy" not in df0.columns
@@ -3021,6 +3416,21 @@ class Hermes3QtMainWindow(QMainWindow):
                             self._pol_cache[ck0] = df0
                         except Exception:
                             pass
+                    try:
+                        need_bxy = "Bxy" not in df0.columns
+                    except Exception:
+                        need_bxy = True
+                    if need_bxy:
+                        try:
+                            df_new = get_1d_poloidal_data(ds0_t, params=["Bxy"], region=region, sepadd=sepadd, target_first=False)
+                            if df_new is not None and "Bxy" in df_new:
+                                try:
+                                    df0["Bxy"] = df_new["Bxy"].values
+                                except Exception:
+                                    pass
+                            self._pol_cache[ck0] = df0
+                        except Exception:
+                            pass
                 # Need geometry coordinate for the chosen x-axis.
                 if df0 is not None and "R" in df0 and ("Spar" in df0 or "Spol" in df0):
                     r = np.asarray(df0["R"].values)
@@ -3031,35 +3441,61 @@ class Hermes3QtMainWindow(QMainWindow):
                         m = np.isfinite(rr) & np.isfinite(ss)
                         if np.any(m):
                             s_use = ss[m]
-                            # Prefer Bpxy minimum (in magnitude) to identify the X-point
-                            try:
-                                bp = np.asarray(df0["Bpxy"].values, dtype=float)
-                                bp_use = bp[m]
-                                mbp = np.isfinite(bp_use)
-                                if np.any(mbp):
-                                    bp2 = np.asarray(bp_use[mbp], dtype=float)
-                                    s2 = np.asarray(s_use[mbp], dtype=float)
-                                    # Avoid false minima at the targets by searching only the middle 75%
-                                    n2 = int(bp2.size)
-                                    lo = int(np.floor(0.125 * n2))
-                                    hi = int(np.ceil(0.875 * n2))
-                                    if hi <= lo:
-                                        lo, hi = 0, n2
-                                    bp_mid = bp2[lo:hi]
-                                    s_mid = s2[lo:hi]
-                                    if bp_mid.size:
-                                        jmid = int(np.nanargmin(np.abs(bp_mid)))
-                                        jmid = int(np.clip(jmid, 0, bp_mid.size - 1))
-                                        xline_rmin = float(s_mid[jmid])
-                            except Exception:
-                                # Fallback: previous heuristic (closest-to-zero R)
+                            if xpt_mode.strip().lower().startswith("min r"):
                                 try:
                                     rr_use = rr[m]
-                                    j0 = int(np.nanargmin(np.abs(rr_use)))
+                                    j0 = int(np.nanargmin(rr_use))
                                     if 0 <= j0 < s_use.size:
                                         xline_rmin = float(s_use[j0])
                                 except Exception:
                                     pass
+                            elif xpt_mode.strip().lower().startswith("bxy"):
+                                # Outer: max(Bxy), Inner: min(Bxy)
+                                try:
+                                    bxy = np.asarray(df0["Bxy"].values, dtype=float)
+                                    bxy_use = bxy[m]
+                                    mb = np.isfinite(bxy_use)
+                                    if np.any(mb):
+                                        b2 = np.asarray(bxy_use[mb], dtype=float)
+                                        s2 = np.asarray(s_use[mb], dtype=float)
+                                        # Avoid target-side extrema: search only the middle 75%
+                                        n2 = int(b2.size)
+                                        lo = int(np.floor(0.125 * n2))
+                                        hi = int(np.ceil(0.875 * n2))
+                                        if hi <= lo:
+                                            lo, hi = 0, n2
+                                        b_mid = b2[lo:hi]
+                                        s_mid = s2[lo:hi]
+                                        if b_mid.size:
+                                            if str(region).startswith("outer"):
+                                                jmid = int(np.nanargmax(b_mid))
+                                            else:
+                                                jmid = int(np.nanargmin(b_mid))
+                                            jmid = int(np.clip(jmid, 0, b_mid.size - 1))
+                                            xline_rmin = float(s_mid[jmid])
+                                except Exception:
+                                    pass
+                            else:
+                                # Default: Bpxy "valley" minimum (until it starts rising again)
+                                try:
+                                    bp = np.asarray(df0["Bpxy"].values, dtype=float)
+                                    bp_use = bp[m]
+                                    mbp = np.isfinite(bp_use)
+                                    if np.any(mbp):
+                                        bp2 = np.asarray(bp_use[mbp], dtype=float)
+                                        s2 = np.asarray(s_use[mbp], dtype=float)
+                                        j = _xpoint_idx_bpxy_valley(bp2)
+                                        if j is not None and 0 <= int(j) < s2.size:
+                                            xline_rmin = float(s2[int(j)])
+                                except Exception:
+                                    # Fallback: closest-to-zero R
+                                    try:
+                                        rr_use = rr[m]
+                                        j0 = int(np.nanargmin(np.abs(rr_use)))
+                                        if 0 <= j0 < s_use.size:
+                                            xline_rmin = float(s_use[j0])
+                                    except Exception:
+                                        pass
         except Exception:
             xline_rmin = None
 
@@ -3715,6 +4151,17 @@ class Hermes3QtMainWindow(QMainWindow):
     def redraw(self) -> None:
         if self._mode_is_2d:
             self._redraw_2d_current_tab()
+            # Also keep optional region-overlay popouts in sync
+            try:
+                if self._region2d_pol:
+                    self._update_region2d_overlay("pol")
+            except Exception:
+                pass
+            try:
+                if self._region2d_rad:
+                    self._update_region2d_overlay("rad")
+            except Exception:
+                pass
             return
 
         self._update_time_readout()
