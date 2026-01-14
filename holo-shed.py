@@ -1912,7 +1912,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 is_2d = False
             except Exception as e:
                 msg = str(e).lower()
-                if ("toroidal" in msg and "grid" in msg) or ("topology" in msg and "grid" in msg) or ("provide grid" in msg):
+                if ("toroidal" in msg and "grid" in msg) or ("topology" in msg and "grid" in msg) or ("provide grid in data directory" in msg):
                     cs = _load_2d()
                     is_2d = True
                 else:
