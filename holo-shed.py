@@ -172,6 +172,36 @@ def _parse_optional_float(text: str) -> Optional[float]:
         return None
 
 
+def _get_option_float(ds, keys: List[str]) -> Optional[float]:
+    """
+    Best-effort extraction of a float from ds.options for a list of candidate keys.
+    Supports both nested options (ds.options["mesh"]["length_xpt"]) and flat keys.
+    """
+    try:
+        opt = getattr(ds, "options", None)
+        if opt is None:
+            return None
+    except Exception:
+        return None
+
+    for k in keys:
+        # Nested form: "mesh:length_xpt"
+        if ":" in k:
+            sec, name = k.split(":", 1)
+            try:
+                v = opt[sec][name]
+                return float(v)
+            except Exception:
+                pass
+        # Flat form: "length_xpt"
+        try:
+            v = opt[k]
+            return float(v)
+        except Exception:
+            pass
+    return None
+
+
 def _format_case_label(case_path: str) -> str:
     p = Path(case_path).expanduser().resolve()
     return p.name or str(p)
@@ -446,7 +476,7 @@ def _ensure_sdtools_on_path():
 # ---- Qt imports (PyQt6 preferred; fall back to PySide6) ----
 try:
     from PyQt6.QtCore import QEvent, Qt, QTimer  # type: ignore
-    from PyQt6.QtGui import QAction, QColor, QPalette  # type: ignore
+    from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut  # type: ignore
     from PyQt6.QtWidgets import (  # type: ignore
         QAbstractItemView,
         QApplication,
@@ -478,7 +508,7 @@ try:
 
 except Exception:  # pragma: no cover
     from PySide6.QtCore import QEvent, Qt, QTimer  # type: ignore
-    from PySide6.QtGui import QAction, QColor, QPalette  # type: ignore
+    from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut  # type: ignore
     from PySide6.QtWidgets import (  # type: ignore
         QAbstractItemView,
         QApplication,
@@ -654,11 +684,35 @@ class Hermes3QtMainWindow(QMainWindow):
         self._pol_cache: Dict[tuple, object] = {}
         self._rad_cache: Dict[tuple, object] = {}
         self._profile_max_points = 2500
+        self._fast_slider_step = 10  # Shift+Arrow moves by this many indices
+
+        # 2D time-slider redraw throttle (keeps dragging responsive)
+        self._time2d_redraw_timer = QTimer(self)
+        self._time2d_redraw_timer.setSingleShot(True)
+        self._time2d_redraw_timer.timeout.connect(self._do_redraw)
+        self._time2d_dragging = False
+
+        # Global keyboard shortcuts (arrow keys)
+        self._time_shortcuts: List["QShortcut"] = []
+
+        # Skip re-rendering 2D tabs when nothing changed
+        self._last_draw_state_2d: Dict[str, object] = {"pol": None, "rad": None, "poly": None, "mon": None}
 
         # General redraw debounce (profiles + 2D tabs)
         self._redraw_timer = QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.timeout.connect(self._do_redraw)
+
+        # Install shortcuts once widgets exist
+        self._install_time_shortcuts()
+        # Also install a global key event filter so plain Left/Right always work
+        # (Qt can treat bare arrow keys as navigation rather than shortcuts).
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+        except Exception:
+            pass
 
         if initial_case_path:
             self.path_edit.setText(str(initial_case_path))
@@ -667,6 +721,34 @@ class Hermes3QtMainWindow(QMainWindow):
             self.set_status("Enter a case directory path and click 'Load dataset'.")
             self.redraw()
             self.request_time_history_redraw()
+
+    # ---------- Keyboard shortcuts ----------
+    def _install_time_shortcuts(self) -> None:
+        """
+        Global shortcuts for time scrubbing (work without focusing the slider).
+        """
+        self._time_shortcuts = []
+
+        def add(seq: str, delta: int) -> None:
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.activated.connect(lambda d=delta: self._nudge_time_slider(d))
+            self._time_shortcuts.append(sc)
+
+        add("Left", -1)
+        add("Right", 1)
+        add("Shift+Left", -int(self._fast_slider_step))
+        add("Shift+Right", int(self._fast_slider_step))
+
+    def _nudge_time_slider(self, delta: int) -> None:
+        slider = self._active_time_slider()
+        try:
+            v = int(slider.value()) + int(delta)
+            v = max(int(slider.minimum()), min(int(slider.maximum()), v))
+            slider.setValue(v)
+            self._set_time_readout_for_index(v)
+        except Exception:
+            return
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -739,10 +821,9 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_slider_2d.setSingleStep(1)
         self.time_slider_2d.setPageStep(1)
         self.time_slider_2d.setValue(0)
-        # Performance: avoid re-plotting on every tick while dragging.
-        # With tracking off, valueChanged fires on release; we update the label live via sliderMoved.
+        # Allow continuous updates while dragging; redraw is throttled separately.
         try:
-            self.time_slider_2d.setTracking(False)
+            self.time_slider_2d.setTracking(True)
         except Exception:
             pass
         self.time_readout_2d = QLabel("time index = 0")
@@ -997,9 +1078,10 @@ class Hermes3QtMainWindow(QMainWindow):
         self.vars_list.itemDoubleClicked.connect(self._on_var_item_double_clicked)
         self.vars_list.customContextMenuRequested.connect(self._on_var_list_context_menu)
         self.time_slider.valueChanged.connect(lambda _v: self.request_redraw())
-        self.time_slider_2d.valueChanged.connect(lambda _v: self.request_redraw())
-        self.time_slider_2d.valueChanged.connect(lambda _v: self._update_time_readout())
+        self.time_slider_2d.valueChanged.connect(self._on_time_slider_2d_changed)
         self.time_slider_2d.sliderMoved.connect(lambda v: self._set_time_readout_for_index(int(v)))
+        self.time_slider_2d.sliderPressed.connect(lambda: self._set_time2d_dragging(True))
+        self.time_slider_2d.sliderReleased.connect(lambda: self._set_time2d_dragging(False, redraw=True))
         self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
         self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
@@ -1370,22 +1452,65 @@ class Hermes3QtMainWindow(QMainWindow):
         Reposition overlay buttons when the canvas resizes.
         """
         try:
+            # Global key handling (plain arrow keys) for time scrubbing
+            et = event.type()
+            if et == QEvent.Type.KeyPress or et == getattr(QEvent, "KeyPress", None):
+                try:
+                    key = int(event.key())
+                    if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                        mods = event.modifiers()
+                        is_shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+                        delta = int(self._fast_slider_step) if is_shift else 1
+                        if key == Qt.Key.Key_Left:
+                            delta = -delta
+                        self._nudge_time_slider(delta)
+                        return True
+                except Exception:
+                    pass
+
             if obj is self.canvas:
-                et = event.type()
                 # PyQt6/PySide6 both expose QEvent.Type.Resize; keep a fallback just in case.
                 if et == QEvent.Type.Resize or et == getattr(QEvent, "Resize", None):
                     self._position_overlay_buttons()
             if obj is getattr(self, "pol_canvas", None):
-                et = event.type()
                 if et == QEvent.Type.Resize or et == getattr(QEvent, "Resize", None):
                     self._position_overlay_buttons_pol()
             if obj is getattr(self, "rad_canvas", None):
-                et = event.type()
                 if et == QEvent.Type.Resize or et == getattr(QEvent, "Resize", None):
                     self._position_overlay_buttons_rad()
         except Exception:
             pass
         return super().eventFilter(obj, event)
+
+    def _on_time_slider_2d_changed(self, v: int) -> None:
+        """
+        Live scrubbing for 2D time slider, but throttle redraw while dragging.
+        """
+        try:
+            self._set_time_readout_for_index(int(v))
+        except Exception:
+            pass
+        if getattr(self, "_time2d_dragging", False):
+            # Restart timer; draw at most ~1 every 60ms while dragging
+            try:
+                self._time2d_redraw_timer.start(60)
+            except Exception:
+                self.request_redraw()
+        else:
+            self.request_redraw()
+
+    def _set_time2d_dragging(self, dragging: bool, *, redraw: bool = False) -> None:
+        try:
+            self._time2d_dragging = bool(dragging)
+        except Exception:
+            return
+        if redraw:
+            # Ensure final position redraws immediately on release
+            try:
+                self._time2d_redraw_timer.stop()
+            except Exception:
+                pass
+            self.request_redraw()
 
     def _clear_overlay_buttons(self) -> None:
         for ylim_btn, yscale_btn in list(self._overlay_buttons.values()):
@@ -2107,6 +2232,27 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _redraw_2d_poloidal(self) -> None:
         self._update_time_readout()
+
+        # If nothing relevant changed since last draw, don't rebuild the figure.
+        try:
+            case = self._primary_case()
+            ti = self._get_time_index_for_case(case) if case else -1
+            region = str(self.pol_region_combo.currentText() or "outer_lower")
+            sepadd = int(self.pol_sepadd_spin.value())
+            vars_to_plot = tuple(self.selected_vars)
+            modes = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
+            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, vars_to_plot, modes)
+            if self._last_draw_state_2d.get("pol") == state_key and self.pol_figure.axes:
+                try:
+                    self._position_overlay_buttons_pol()
+                except Exception:
+                    pass
+                self.pol_canvas.draw_idle()
+                return
+            self._last_draw_state_2d["pol"] = state_key
+        except Exception:
+            pass
+
         self.pol_figure.clear()
         try:
             self.pol_figure.set_facecolor("white")
@@ -2147,6 +2293,32 @@ class Hermes3QtMainWindow(QMainWindow):
             ax.text(0.5, 0.5, f"sdtools import error:\n{e}", ha="center", va="center", transform=ax.transAxes)
             self.pol_canvas.draw_idle()
             return
+
+        # Reference: mark the location along the field line where R is closest to 0
+        # for the currently selected sepadd. Label as the X-point.
+        xline_rmin = None
+        try:
+            c0 = self._primary_case()
+            if c0 is not None:
+                ds0_t = self._ds_at_time(c0)
+                ti0 = self._get_time_index_for_case(c0)
+                ck0 = (c0.label, ti0, region, sepadd, ("__geom__",))
+                df0 = self._pol_cache.get(ck0)
+                if df0 is None:
+                    try:
+                        df0 = get_1d_poloidal_data(ds0_t, params=[], region=region, sepadd=sepadd, target_first=False)
+                    except Exception:
+                        df0 = None
+                    self._pol_cache[ck0] = df0
+                if df0 is not None and "R" in df0 and "Spar" in df0:
+                    r = np.asarray(df0["R"].values)
+                    s = np.asarray(df0["Spar"].values)
+                    if r.size and s.size:
+                        i0 = int(np.nanargmin(np.abs(r)))
+                        if 0 <= i0 < s.size:
+                            xline_rmin = float(s[i0])
+        except Exception:
+            xline_rmin = None
 
         # Batch extract once per case/time/region/sepadd for speed
         # Configure y-scales per variable before plotting
@@ -2205,6 +2377,22 @@ class Hermes3QtMainWindow(QMainWindow):
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"S$_\parallel$ (m)")
+            if xline_rmin is not None and np.isfinite(xline_rmin):
+                try:
+                    ax.axvline(xline_rmin, color="k", linewidth=1.0, linestyle="--")
+                    ax.text(
+                        xline_rmin,
+                        0.98,
+                        "X-point",
+                        rotation=90,
+                        transform=ax.get_xaxis_transform(),
+                        va="top",
+                        ha="left",
+                        fontsize=8,
+                        color="k",
+                    )
+                except Exception:
+                    pass
 
             # Apply ylim mode using currently plotted data (fast)
             try:
@@ -2229,6 +2417,26 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _redraw_2d_radial(self) -> None:
         self._update_time_readout()
+
+        # If nothing relevant changed since last draw, don't rebuild the figure.
+        try:
+            case = self._primary_case()
+            ti = self._get_time_index_for_case(case) if case else -1
+            region = str(self.rad_region_combo.currentText() or "omp")
+            vars_to_plot = tuple(self.selected_vars)
+            modes = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
+            state_key = ("rad", getattr(case, "label", None), ti, region, vars_to_plot, modes)
+            if self._last_draw_state_2d.get("rad") == state_key and self.rad_figure.axes:
+                try:
+                    self._position_overlay_buttons_rad()
+                except Exception:
+                    pass
+                self.rad_canvas.draw_idle()
+                return
+            self._last_draw_state_2d["rad"] = state_key
+        except Exception:
+            pass
+
         self.rad_figure.clear()
         try:
             self.rad_figure.set_facecolor("white")
@@ -2260,15 +2468,23 @@ class Hermes3QtMainWindow(QMainWindow):
         axes = [self.rad_figure.add_subplot(gs[i % nrows, i // nrows]) for i in range(n)]
 
         try:
-            # sdtools currently provides two implementations; the "_old" version avoids
-            # relying on an 'xr' alias being present.
-            from hermes3.selectors import get_1d_radial_data_old as get_1d_radial_data  # type: ignore
+            # Prefer the vectorized sdtools implementation (much faster for omp/imp),
+            # but it expects an `xr` alias in the module. Provide it here.
+            import xarray as xr  # type: ignore
+            import hermes3.selectors as _sel  # type: ignore
+
+            setattr(_sel, "xr", xr)
+            get_1d_radial_data = _sel.get_1d_radial_data  # type: ignore[attr-defined]
         except Exception as e:
-            ax = self.rad_figure.add_subplot(1, 1, 1)
-            ax.set_axis_off()
-            ax.text(0.5, 0.5, f"sdtools import error:\n{e}", ha="center", va="center", transform=ax.transAxes)
-            self.rad_canvas.draw_idle()
-            return
+            # Fallback: older loop-based implementation (slower for omp/imp but robust).
+            try:
+                from hermes3.selectors import get_1d_radial_data_old as get_1d_radial_data  # type: ignore
+            except Exception as e2:
+                ax = self.rad_figure.add_subplot(1, 1, 1)
+                ax.set_axis_off()
+                ax.text(0.5, 0.5, f"sdtools import error:\n{e}\n{e2}", ha="center", va="center", transform=ax.transAxes)
+                self.rad_canvas.draw_idle()
+                return
 
         # Batch extract once per case/time/region for speed
         # Configure y-scales per variable before plotting
@@ -2326,6 +2542,22 @@ class Hermes3QtMainWindow(QMainWindow):
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"$r^\prime - r_{sep}$ (m)")
+            # Separatrix marker
+            try:
+                ax.axvline(0.0, color="k", linestyle="--", linewidth=1.0)
+                ax.text(
+                    0.0,
+                    0.98,
+                    "separatrix",
+                    rotation=90,
+                    transform=ax.get_xaxis_transform(),
+                    va="top",
+                    ha="left",
+                    fontsize=8,
+                    color="k",
+                )
+            except Exception:
+                pass
 
             try:
                 ylim_mode = self._ylim_mode_by_var.get(name, "auto")
@@ -2347,6 +2579,24 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _redraw_2d_polygon(self) -> None:
         self._update_time_readout()
+
+        # If nothing relevant changed since last draw, don't rebuild the figure.
+        try:
+            case = self._primary_case()
+            ti = self._get_time_index_for_case(case) if case else -1
+            var = str(self.poly_var_combo.currentText() or "").strip()
+            grid_only = bool(self.poly_grid_only_check.isChecked())
+            logscale = bool(self.poly_log_check.isChecked())
+            vmin = _parse_optional_float(self.poly_vmin_edit.text())
+            vmax = _parse_optional_float(self.poly_vmax_edit.text())
+            state_key = ("poly", getattr(case, "label", None), ti, var, grid_only, logscale, vmin, vmax)
+            if self._last_draw_state_2d.get("poly") == state_key and self.poly_figure.axes:
+                self.poly_canvas.draw_idle()
+                return
+            self._last_draw_state_2d["poly"] = state_key
+        except Exception:
+            pass
+
         self.poly_figure.clear()
         try:
             self.poly_figure.set_facecolor("white")
@@ -2417,6 +2667,18 @@ class Hermes3QtMainWindow(QMainWindow):
         self.poly_canvas.draw_idle()
 
     def _redraw_2d_monitor(self) -> None:
+        # If nothing relevant changed since last draw, don't rebuild the figure.
+        try:
+            case = self._primary_case()
+            sepadd = int(self.pol_sepadd_spin.value()) if hasattr(self, "pol_sepadd_spin") else 0
+            state_key = ("mon", getattr(case, "label", None), sepadd)
+            if self._last_draw_state_2d.get("mon") == state_key and self.mon_figure.axes:
+                self.mon_canvas.draw_idle()
+                return
+            self._last_draw_state_2d["mon"] = state_key
+        except Exception:
+            pass
+
         self.mon_figure.clear()
         try:
             self.mon_figure.set_facecolor("white")
@@ -2712,6 +2974,27 @@ class Hermes3QtMainWindow(QMainWindow):
                     ax.plot(x, y, label=c.label)
                 except Exception as e:
                     self.set_status(f"Plot error for {name}: {e}", is_error=True)
+
+            # X-point marker from options (1D only)
+            try:
+                ds0 = next(iter(self.cases.values())).ds
+                xpt = _get_option_float(ds0, ["length_xpt", "mesh:length_xpt"])
+                if xpt is not None and np.isfinite(xpt):
+                    ax.axvline(xpt, color="k", linewidth=1.0, alpha=0.7, linestyle="--")
+                    ax.text(
+                        xpt,
+                        0.98,
+                        "X-point",
+                        rotation=90,
+                        transform=ax.get_xaxis_transform(),
+                        va="top",
+                        ha="left",
+                        fontsize=8,
+                        color="k",
+                        alpha=0.7,
+                    )
+            except Exception:
+                pass
 
             ax.set_title(name, fontsize=10)
             ax.set_ylabel(f"({units})" if units else "")
