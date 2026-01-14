@@ -173,6 +173,8 @@ def _xpoint_idx_bpxy_valley(bp: np.ndarray) -> Optional[int]:
     return int(best_i)
 
 
+
+
 def _guard_replace_1d_profile_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Guard-replace for *profiles* (x,y arrays).
@@ -2893,8 +2895,8 @@ class Hermes3QtMainWindow(QMainWindow):
                         get_1d_radial_data = _sel.get_1d_radial_data  # type: ignore[attr-defined]
                     except Exception:
                         from hermes3.selectors import get_1d_radial_data_old as get_1d_radial_data  # type: ignore
-                    # Need R/Z in the output to draw the overlay. The selector does not
-                    # include these unless explicitly requested.
+                    # NOTE: sdtools currently does not actually include R/Z in the output
+                    # for this selector, but we keep this call "clean" while you prepare a PR.
                     df = get_1d_radial_data(ds_t, params=["R", "Z"], region=region, guards=False, sol=True, core=True)
                     self._rad_cache[ck] = df
             if df is None or ("R" not in df) or ("Z" not in df):
@@ -2910,7 +2912,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 ccol = "Spol" if use_spol else "Spar"
             else:
                 ccol = "Srad"
-            c0 = np.asarray(df[ccol].values, dtype=float) if ccol in df else None
+            c0 = np.asarray(df[ccol].values, dtype=float) if (df is not None and ccol in df) else None
 
             m = np.isfinite(R0) & np.isfinite(Z0)
             if c0 is not None:
