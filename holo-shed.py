@@ -69,13 +69,21 @@ def _is_plottable_1d_var(da, spatial_dim: str, time_dim: Optional[str]) -> bool:
 
 def _list_plottable_vars(ds, spatial_dim: str, time_dim: Optional[str]) -> List[str]:
     out: List[str] = []
-    for name, da in ds.data_vars.items():
+    # Include derived/geometry coordinates (e.g. R, Z) as plottable options too.
+    # Avoid listing the coordinate axes themselves.
+    ignore = {spatial_dim}
+    if time_dim:
+        ignore.add(time_dim)
+    for name in getattr(ds, "variables", {}).keys():
+        if name in ignore:
+            continue
         try:
+            da = ds[name]
             if _is_plottable_1d_var(da, spatial_dim=spatial_dim, time_dim=time_dim):
                 out.append(name)
         except Exception:
             continue
-    return sorted(out)
+    return sorted(set(out))
 
 
 def _is_plottable_2d_var(da, time_dim: Optional[str]) -> bool:
@@ -98,13 +106,29 @@ def _is_plottable_2d_var(da, time_dim: Optional[str]) -> bool:
 
 def _list_plottable_vars_2d(ds, time_dim: Optional[str]) -> List[str]:
     out: List[str] = []
-    for name, da in ds.data_vars.items():
+    # Include derived/geometry coordinates (e.g. R, Z) as plottable options too.
+    ignore = {"x", "theta", "y"}
+    if time_dim:
+        ignore.add(time_dim)
+    for name in getattr(ds, "variables", {}).keys():
+        if name in ignore:
+            continue
         try:
+            da = ds[name]
             if _is_plottable_2d_var(da, time_dim=time_dim):
                 out.append(name)
         except Exception:
             continue
-    return sorted(out)
+    return sorted(set(out))
+
+
+def _selector_params_only(vars_to_plot: List[str]) -> List[str]:
+    """
+    sdtools selectors always provide geometry columns like Spar/Spol/R/Z.
+    Avoid requesting those as "params" to keep selectors robust.
+    """
+    geom = {"Spar", "Spol", "Srad", "R", "Z"}
+    return [v for v in vars_to_plot if v not in geom]
 
 
 def _guard_replace_1d_profile_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -672,7 +696,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.selected_vars: List[str] = []  # preserve selection order
         self._selected_set: set[str] = set()
         self._yscale_by_var: Dict[str, str] = {}  # var -> {"linear","log","symlog"}
-        self._ylim_mode_by_var: Dict[str, str] = {}  # var -> {"auto","final","global"}
+        self._ylim_mode_by_var: Dict[str, str] = {}  # var -> {"auto","final","max"} (legacy: "global" == "max")
         self._var_filter: str = ""
 
         self._build_ui()
@@ -721,11 +745,16 @@ class Hermes3QtMainWindow(QMainWindow):
         self._mon_cache: Dict[tuple, tuple] = {}
         self._pol_cache: Dict[tuple, object] = {}
         self._rad_cache: Dict[tuple, object] = {}
+        # Cached y-limits for 2D extracted 1D plots (poloidal/radial)
+        self._pol_ylim_cache: Dict[tuple, Tuple[Optional[float], Optional[float]]] = {}
+        self._rad_ylim_cache: Dict[tuple, Tuple[Optional[float], Optional[float]]] = {}
         self._profile_max_points = 2500
         self._fast_slider_step = 10  # Shift+Arrow moves by this many indices
         # 2D polygon colorbar limits are only applied when user confirms
         self._poly_vmin_active: Optional[float] = None
         self._poly_vmax_active: Optional[float] = None
+        # Preserve 1D toolbar zoom/pan across time scrubbing
+        self._last_draw_state_1d_profiles: Optional[tuple] = None
         # 2D polygon artist reuse (fast time slider updates)
         self._poly_plot_state: Optional[tuple] = None
         self._poly_ax = None
@@ -899,8 +928,9 @@ class Hermes3QtMainWindow(QMainWindow):
             pass
         time2d_row.addWidget(self.time_ms_spin_2d)
 
-        # Keep the old label for backwards compatibility (not shown)
-        self.time_readout_2d = QLabel("time index = 0")
+        # Keep the old label for backwards compatibility (must be parented to avoid becoming a top-level window)
+        self.time_readout_2d = QLabel("time index = 0", self.time2d_widget)
+        self.time_readout_2d.setVisible(False)
         time2d_layout.addLayout(time2d_row)
         self.time2d_widget.setVisible(False)
         left_layout.addWidget(self.time2d_widget)
@@ -973,6 +1003,10 @@ class Hermes3QtMainWindow(QMainWindow):
         pol_sepadd_row.addWidget(self.pol_sepadd_spin)
         pol_sepadd_row.addStretch(1)
         pol_ctrl_layout.addLayout(pol_sepadd_row)
+
+        self.pol_use_spol_check = QCheckBox("Plot vs Spol (instead of Spar)")
+        self.pol_use_spol_check.setChecked(False)
+        pol_ctrl_layout.addWidget(self.pol_use_spol_check)
         pol_ctrl_layout.addStretch(1)
 
         self._rad_ctrl_tab = QWidget()
@@ -1038,7 +1072,7 @@ class Hermes3QtMainWindow(QMainWindow):
         mon_ctrl_layout = QVBoxLayout(self._mon_ctrl_tab)
         mon_ctrl_layout.setContentsMargins(6, 6, 6, 6)
         mon_ctrl_layout.setSpacing(6)
-        mon_ctrl_layout.addWidget(QLabel("Monitor: Te/Ne at OMP + target"))
+        mon_ctrl_layout.addWidget(QLabel("Time history at OMP + target (from selected variables)"))
         mon_ctrl_layout.addStretch(1)
 
         # Right panel
@@ -1094,9 +1128,11 @@ class Hermes3QtMainWindow(QMainWindow):
             pass
         slider_row.addWidget(self.time_ms_spin)
 
-        # Keep old widgets for backwards compatibility (not shown)
-        self.time_readout = QLabel("time index = 0")
-        self._time_index_label_1d = QLabel("time index")
+        # Keep old widgets for backwards compatibility (parent + hidden to avoid top-level popup windows)
+        self.time_readout = QLabel("time index = 0", prof_plot_tab)
+        self.time_readout.setVisible(False)
+        self._time_index_label_1d = QLabel("time index", prof_plot_tab)
+        self._time_index_label_1d.setVisible(False)
         prof_plot_layout.addLayout(slider_row)
 
         hist_plot_tab = QWidget()
@@ -1147,8 +1183,8 @@ class Hermes3QtMainWindow(QMainWindow):
         poly_plot_layout.addWidget(self.poly_toolbar)
         poly_plot_layout.addWidget(self.poly_canvas, 1)
 
-        self._tab2d_monitor = QWidget()
-        mon_plot_layout = QVBoxLayout(self._tab2d_monitor)
+        self._tab2d_timehist = QWidget()
+        mon_plot_layout = QVBoxLayout(self._tab2d_timehist)
         mon_plot_layout.setContentsMargins(0, 0, 0, 0)
         mon_plot_layout.setSpacing(6)
         self.mon_figure = Figure(figsize=(10.5, 7.5))
@@ -1189,6 +1225,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_ms_spin_2d.valueChanged.connect(self._on_time_ms_spin_2d_changed)
         self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
+        self.pol_use_spol_check.toggled.connect(lambda _v: self.request_redraw())
         self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_grid_only_check.toggled.connect(lambda _v: self.request_redraw())
@@ -1210,7 +1247,7 @@ class Hermes3QtMainWindow(QMainWindow):
         1D:
           - Profiles + Time history
         2D:
-          - Poloidal 1D + Radial 1D + 2D field + Monitor
+          - Poloidal 1D + Radial 1D + 2D field + Time history
         """
         self._mode_is_2d = bool(is_2d)
 
@@ -1243,12 +1280,12 @@ class Hermes3QtMainWindow(QMainWindow):
             self.plot_tabs.addTab(self._tab2d_poloidal, "Poloidal 1D")
             self.plot_tabs.addTab(self._tab2d_radial, "Radial 1D")
             self.plot_tabs.addTab(self._tab2d_polygon, "2D field")
-            self.plot_tabs.addTab(self._tab2d_monitor, "Monitor")
+            self.plot_tabs.addTab(self._tab2d_timehist, "Time history")
 
             self.controls_tabs.addTab(self._pol_ctrl_tab, "Poloidal 1D")
             self.controls_tabs.addTab(self._rad_ctrl_tab, "Radial 1D")
             self.controls_tabs.addTab(self._poly_ctrl_tab, "2D field")
-            self.controls_tabs.addTab(self._mon_ctrl_tab, "Monitor")
+            self.controls_tabs.addTab(self._mon_ctrl_tab, "Time history")
 
             # Show global 2D time control; hide 1D slider embedded in profiles tab.
             try:
@@ -1256,11 +1293,9 @@ class Hermes3QtMainWindow(QMainWindow):
             except Exception:
                 pass
             for w in (
-                getattr(self, "_time_index_label_1d", None),
                 getattr(self, "time_spin", None),
                 getattr(self, "time_ms_spin", None),
                 getattr(self, "time_slider", None),
-                getattr(self, "time_readout", None),
             ):
                 try:
                     if w is not None:
@@ -1284,11 +1319,9 @@ class Hermes3QtMainWindow(QMainWindow):
             except Exception:
                 pass
             for w in (
-                getattr(self, "_time_index_label_1d", None),
                 getattr(self, "time_spin", None),
                 getattr(self, "time_ms_spin", None),
                 getattr(self, "time_slider", None),
-                getattr(self, "time_readout", None),
             ):
                 try:
                     if w is not None:
@@ -1453,7 +1486,7 @@ class Hermes3QtMainWindow(QMainWindow):
     def request_time_history_redraw(self) -> None:
 
         if self._mode_is_2d:
-            # 2D mode uses the Monitor tab instead of the 1D time-history view.
+            # 2D mode uses the Time history tab instead of the 1D time-history view.
             self._redraw_2d_monitor()
             return
 
@@ -1598,7 +1631,10 @@ class Hermes3QtMainWindow(QMainWindow):
         return "y:lin"
 
     def _cycle_ylim_mode(self, current: str) -> str:
-        order = ["auto", "final", "global"]
+        # Legacy support: older sessions may store "global"
+        if current == "global":
+            current = "max"
+        order = ["auto", "final", "max"]
         try:
             i = order.index(current)
         except ValueError:
@@ -1608,7 +1644,7 @@ class Hermes3QtMainWindow(QMainWindow):
     def _ylim_mode_label(self, mode: str) -> str:
         if mode == "final":
             return "ylim:final"
-        if mode == "global":
+        if mode in ("global", "max"):
             return "ylim:max"
         return "ylim:auto"
 
@@ -1623,7 +1659,7 @@ class Hermes3QtMainWindow(QMainWindow):
         menu = QMenu(self)
 
         act_cycle_y = QAction("Cycle y-scale (linear → log → symlog)", self)
-        act_cycle_ylim = QAction("Cycle y-limits (auto → final → global)", self)
+        act_cycle_ylim = QAction("Cycle y-limits (auto → final → max)", self)
         menu.addAction(act_cycle_y)
         menu.addAction(act_cycle_ylim)
         menu.addSeparator()
@@ -1638,10 +1674,13 @@ class Hermes3QtMainWindow(QMainWindow):
             m_y.addAction(a)
 
         m_ylim = menu.addMenu("Set y-limits")
-        for mode in ("auto", "final", "global"):
+        for mode in ("auto", "final", "max"):
             a = QAction(mode, self)
             a.setCheckable(True)
-            a.setChecked(self._ylim_mode_by_var.get(name, "auto") == mode)
+            curm = self._ylim_mode_by_var.get(name, "auto")
+            if curm == "global":
+                curm = "max"
+            a.setChecked(curm == mode)
             a.triggered.connect(lambda _=False, m=mode: self._set_var_ylim_mode(name, m))
             m_ylim.addAction(a)
 
@@ -1679,6 +1718,9 @@ class Hermes3QtMainWindow(QMainWindow):
         self.request_redraw()
 
     def _set_var_ylim_mode(self, varname: str, mode: str) -> None:
+        # Legacy: allow "global" as alias for "max"
+        if mode == "global":
+            mode = "max"
         self._ylim_mode_by_var[varname] = mode
         self._refresh_var_item(varname)
         self._refresh_overlay_button_labels(varname)
@@ -2340,6 +2382,11 @@ class Hermes3QtMainWindow(QMainWindow):
                 self._rad_cache.clear()
             except Exception:
                 pass
+            try:
+                self._pol_ylim_cache.clear()
+                self._rad_ylim_cache.clear()
+            except Exception:
+                pass
             self.request_time_history_redraw()
         except Exception as e:
             self.set_status(f"Failed to load dataset: {e}", is_error=True)
@@ -2477,6 +2524,342 @@ class Hermes3QtMainWindow(QMainWindow):
             return None
         return next(iter(self.cases.values()))
 
+    def _maybe_capture_view_2d(self, *, kind: str, state_key_no_ti: tuple) -> Optional[Dict[str, tuple]]:
+        """
+        Preserve toolbar zoom/pan across time-slider redraws.
+
+        We only preserve view state when the redraw is "same plot config, different time index",
+        i.e. when the last drawn key (with ti removed) matches the incoming key.
+        """
+        try:
+            last = self._last_draw_state_2d.get(kind)
+        except Exception:
+            last = None
+        if not last:
+            return None
+        try:
+            if kind == "pol":
+                # ("pol", label, ti, region, sepadd, vars_to_plot, modes)
+                last_no_ti = ("pol", last[1], last[3], last[4], last[5], last[6])
+                axes_map = self._overlay_axes_by_var_pol
+                fig_axes = set(getattr(self.pol_figure, "axes", []))
+            else:
+                # ("rad", label, ti, region, vars_to_plot, modes)
+                last_no_ti = ("rad", last[1], last[3], last[4], last[5])
+                axes_map = self._overlay_axes_by_var_rad
+                fig_axes = set(getattr(self.rad_figure, "axes", []))
+        except Exception:
+            return None
+        if last_no_ti != state_key_no_ti:
+            return None
+
+        out: Dict[str, tuple] = {}
+        for v, ax in list(axes_map.items()):
+            try:
+                if ax not in fig_axes:
+                    continue
+                out[v] = (ax.get_xlim(), ax.get_ylim())
+            except Exception:
+                continue
+        return out or None
+
+    def _restore_view_2d(self, *, views: Optional[Dict[str, tuple]], vars_to_plot: List[str], axes: List["object"]) -> None:
+        if not views:
+            return
+        for v, ax in zip(vars_to_plot, axes):
+            lims = views.get(v)
+            if not lims:
+                continue
+            xlim, ylim = lims
+            try:
+                ax.set_xlim(xlim)
+            except Exception:
+                pass
+            try:
+                ax.set_ylim(ylim)
+            except Exception:
+                pass
+
+    def _reset_toolbar_home(self, toolbar) -> None:
+        """
+        When we rebuild axes (figure.clear()), the Matplotlib navigation toolbar's
+        stored view stack can point to old axes, making the Home button unreliable.
+
+        Reset the stack and set "home" to the current default view.
+        """
+        if toolbar is None:
+            return
+        try:
+            st = getattr(toolbar, "_nav_stack", None)
+            if st is not None:
+                try:
+                    st.clear()
+                except Exception:
+                    # Fallback for older matplotlib Stack implementation
+                    try:
+                        st._elements.clear()  # type: ignore[attr-defined]
+                        st._pos = 0  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+            # Push current view as the new home
+            try:
+                toolbar.push_current()
+            except Exception:
+                pass
+            try:
+                toolbar.set_history_buttons()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _maybe_capture_view_1d(self, *, state_key_no_ti: tuple) -> Optional[Dict[str, tuple]]:
+        """
+        Preserve toolbar zoom/pan across 1D time-slider redraws.
+
+        Only capture when the last drawn key (with ti removed) matches the incoming key.
+        """
+        last = getattr(self, "_last_draw_state_1d_profiles", None)
+        if not last:
+            return None
+        try:
+            # ("prof", case_labels, ti, sdim, vars_to_plot, modes, guard_replace)
+            last_no_ti = ("prof", last[1], last[3], last[4], last[5], last[6])
+        except Exception:
+            return None
+        if last_no_ti != state_key_no_ti:
+            return None
+
+        out: Dict[str, tuple] = {}
+        try:
+            fig_axes = set(getattr(self.figure, "axes", []))
+        except Exception:
+            fig_axes = set()
+        for v, ax in list(getattr(self, "_overlay_axes_by_var", {}).items()):
+            try:
+                if ax not in fig_axes:
+                    continue
+                out[v] = (ax.get_xlim(), ax.get_ylim())
+            except Exception:
+                continue
+        return out or None
+
+    def _ds_at_time_index(self, case: _LoadedCase, ti: int):
+        """
+        Like _ds_at_time(), but for an explicit time index (used for ylim computations).
+        Ensures sdtools metadata/options survive slicing.
+        """
+        ds = case.ds
+        tdim = self.state.get("time_dim")
+        if tdim and tdim in getattr(ds, "dims", {}):
+            try:
+                ds_t = ds.isel({tdim: int(ti)})
+            except Exception:
+                ds_t = ds
+        else:
+            ds_t = ds
+        # Reattach metadata/options so selectors keep working
+        try:
+            if hasattr(ds, "metadata") and not hasattr(ds_t, "metadata"):
+                ds_t.metadata = ds.metadata  # type: ignore[attr-defined]
+            elif hasattr(ds, "metadata") and hasattr(ds_t, "metadata"):
+                try:
+                    ds_t.metadata.update(ds.metadata)  # type: ignore[attr-defined]
+                except Exception:
+                    ds_t.metadata = ds.metadata  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            if hasattr(ds, "options") and not hasattr(ds_t, "options"):
+                ds_t.options = ds.options  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            _ensure_sdtools_2d_metadata(ds_t)
+        except Exception:
+            pass
+        return ds_t
+
+    def _with_margin(self, ymin: float, ymax: float) -> Tuple[float, float]:
+        if not np.isfinite(ymin) or not np.isfinite(ymax):
+            return ymin, ymax
+        if ymax > ymin:
+            m = 0.05 * (ymax - ymin)
+            return ymin - m, ymax + m
+        # Degenerate
+        m = 0.1 * (abs(ymax) if ymax != 0 else 1.0)
+        return ymin - m, ymax + m
+
+    def _compute_ylim_poloidal_extracted(
+        self,
+        *,
+        case: _LoadedCase,
+        region: str,
+        sepadd: int,
+        varname: str,
+        yscale: str,
+        mode: str,
+        get_1d_poloidal_data,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Compute y-limits for 2D poloidal extracted 1D profiles.
+        Modes match the 1D GUI: auto/final/max (legacy: global==max).
+        """
+        key = ("pol", case.label, region, int(sepadd), varname, yscale, mode, int(case.n_time))
+        hit = self._pol_ylim_cache.get(key)
+        if hit is not None:
+            return hit
+
+        def _accum_from_df(df, cur_min, cur_max):
+            try:
+                y = np.asarray(df[varname].values, dtype=float)
+            except Exception:
+                return cur_min, cur_max
+            if yscale == "log":
+                y = y[y > 0]
+            y = y[np.isfinite(y)]
+            if y.size == 0:
+                return cur_min, cur_max
+            ym, yM = float(np.nanmin(y)), float(np.nanmax(y))
+            if cur_min is None or ym < cur_min:
+                cur_min = ym
+            if cur_max is None or yM > cur_max:
+                cur_max = yM
+            return cur_min, cur_max
+
+        ymin: Optional[float] = None
+        ymax: Optional[float] = None
+
+        if mode == "global":
+            mode = "max"
+        if mode == "final":
+            tis = [max(0, int(case.n_time) - 1)]
+        elif mode == "max":
+            # User-requested: compute across all time slices
+            tis = list(range(int(case.n_time)))
+        else:
+            return None, None
+
+        for ti in tis:
+            ck = (case.label, int(ti), region, int(sepadd))
+            df = self._pol_cache.get(ck)
+            if df is None:
+                try:
+                    ds_t = self._ds_at_time_index(case, int(ti))
+                    df = get_1d_poloidal_data(ds_t, params=[varname], region=region, sepadd=int(sepadd), target_first=False)
+                except Exception:
+                    df = None
+                self._pol_cache[ck] = df
+            else:
+                try:
+                    missing = [varname] if varname not in df.columns else []
+                except Exception:
+                    missing = [varname]
+                if missing:
+                    try:
+                        ds_t = self._ds_at_time_index(case, int(ti))
+                        df_new = get_1d_poloidal_data(ds_t, params=missing, region=region, sepadd=int(sepadd), target_first=False)
+                        if df_new is not None and varname in df_new:
+                            df[varname] = df_new[varname].values
+                        self._pol_cache[ck] = df
+                    except Exception:
+                        pass
+            if df is None:
+                continue
+            ymin, ymax = _accum_from_df(df, ymin, ymax)
+
+        if ymin is None or ymax is None:
+            out = (None, None)
+        else:
+            a, b = self._with_margin(float(ymin), float(ymax))
+            out = (a, b)
+        self._pol_ylim_cache[key] = out
+        return out
+
+    def _compute_ylim_radial_extracted(
+        self,
+        *,
+        case: _LoadedCase,
+        region: str,
+        varname: str,
+        yscale: str,
+        mode: str,
+        get_1d_radial_data,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Compute y-limits for 2D radial extracted 1D profiles.
+        Modes match the 1D GUI: auto/final/max (legacy: global==max).
+        """
+        key = ("rad", case.label, region, varname, yscale, mode, int(case.n_time))
+        hit = self._rad_ylim_cache.get(key)
+        if hit is not None:
+            return hit
+
+        def _accum_from_df(df, cur_min, cur_max):
+            try:
+                y = np.asarray(df[varname].values, dtype=float)
+            except Exception:
+                return cur_min, cur_max
+            if yscale == "log":
+                y = y[y > 0]
+            y = y[np.isfinite(y)]
+            if y.size == 0:
+                return cur_min, cur_max
+            ym, yM = float(np.nanmin(y)), float(np.nanmax(y))
+            if cur_min is None or ym < cur_min:
+                cur_min = ym
+            if cur_max is None or yM > cur_max:
+                cur_max = yM
+            return cur_min, cur_max
+
+        ymin: Optional[float] = None
+        ymax: Optional[float] = None
+
+        if mode == "global":
+            mode = "max"
+        if mode == "final":
+            tis = [max(0, int(case.n_time) - 1)]
+        elif mode == "max":
+            tis = list(range(int(case.n_time)))
+        else:
+            return None, None
+
+        for ti in tis:
+            ck = (case.label, int(ti), region)
+            df = self._rad_cache.get(ck)
+            if df is None:
+                try:
+                    ds_t = self._ds_at_time_index(case, int(ti))
+                    df = get_1d_radial_data(ds_t, params=[varname], region=region, guards=False, sol=True, core=True)
+                except Exception:
+                    df = None
+                self._rad_cache[ck] = df
+            else:
+                try:
+                    missing = [varname] if varname not in df.columns else []
+                except Exception:
+                    missing = [varname]
+                if missing:
+                    try:
+                        ds_t = self._ds_at_time_index(case, int(ti))
+                        df_new = get_1d_radial_data(ds_t, params=missing, region=region, guards=False, sol=True, core=True)
+                        if df_new is not None and varname in df_new:
+                            df[varname] = df_new[varname].values
+                        self._rad_cache[ck] = df
+                    except Exception:
+                        pass
+            if df is None:
+                continue
+            ymin, ymax = _accum_from_df(df, ymin, ymax)
+
+        if ymin is None or ymax is None:
+            out = (None, None)
+        else:
+            a, b = self._with_margin(float(ymin), float(ymax))
+            out = (a, b)
+        self._rad_ylim_cache[key] = out
+        return out
+
     def _ds_at_time(self, case: _LoadedCase):
         ds = case.ds
         tdim = self.state.get("time_dim")
@@ -2536,14 +2919,16 @@ class Hermes3QtMainWindow(QMainWindow):
         self._update_time_readout()
 
         # If nothing relevant changed since last draw, don't rebuild the figure.
+        _view_restore = None
         try:
             case = self._primary_case()
             ti = self._get_time_index_for_case(case) if case else -1
             region = str(self.pol_region_combo.currentText() or "outer_lower")
             sepadd = int(self.pol_sepadd_spin.value())
+            use_spol = bool(getattr(self, "pol_use_spol_check", None).isChecked()) if hasattr(self, "pol_use_spol_check") else False
             vars_to_plot = tuple(self.selected_vars)
             modes = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
-            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, vars_to_plot, modes)
+            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, use_spol, vars_to_plot, modes)
             if self._last_draw_state_2d.get("pol") == state_key and self.pol_figure.axes:
                 try:
                     self._position_overlay_buttons_pol()
@@ -2551,6 +2936,9 @@ class Hermes3QtMainWindow(QMainWindow):
                     pass
                 self.pol_canvas.draw_idle()
                 return
+            # Preserve zoom/pan across time changes (same config, different ti)
+            state_no_ti = ("pol", getattr(case, "label", None), region, sepadd, use_spol, vars_to_plot, modes)
+            _view_restore = self._maybe_capture_view_2d(kind="pol", state_key_no_ti=state_no_ti)
             self._last_draw_state_2d["pol"] = state_key
         except Exception:
             pass
@@ -2578,6 +2966,9 @@ class Hermes3QtMainWindow(QMainWindow):
 
         region = str(self.pol_region_combo.currentText() or "outer_lower")
         sepadd = int(self.pol_sepadd_spin.value())
+        use_spol = bool(getattr(self, "pol_use_spol_check", None).isChecked()) if hasattr(self, "pol_use_spol_check") else False
+        xcol = "Spol" if use_spol else "Spar"
+        xlab = (r"S$_{pol}$ (m)" if use_spol else r"S$_\parallel$ (m)")
 
         # Layout similar to 1D profiles
         n = len(vars_to_plot)
@@ -2596,29 +2987,79 @@ class Hermes3QtMainWindow(QMainWindow):
             self.pol_canvas.draw_idle()
             return
 
-        # Reference: mark the location along the field line where R is closest to 0
-        # for the currently selected sepadd. Label as the X-point.
+        # Reference: mark the X-point location along the field line.
+        # Use minimum |Bpxy| along the selected region/sepadd (robust for both inner/outer).
         xline_rmin = None
         try:
             c0 = self._primary_case()
             if c0 is not None:
                 ds0_t = self._ds_at_time(c0)
                 ti0 = self._get_time_index_for_case(c0)
-                ck0 = (c0.label, ti0, region, sepadd, ("__geom__",))
+                ck0 = (c0.label, ti0, region, sepadd)
                 df0 = self._pol_cache.get(ck0)
                 if df0 is None:
                     try:
+                        # params=[] still returns geometry columns like Spar/R
                         df0 = get_1d_poloidal_data(ds0_t, params=[], region=region, sepadd=sepadd, target_first=False)
                     except Exception:
                         df0 = None
                     self._pol_cache[ck0] = df0
-                if df0 is not None and "R" in df0 and "Spar" in df0:
+                # Ensure Bpxy exists in the cached df (incremental add)
+                if df0 is not None:
+                    try:
+                        need_bpxy = "Bpxy" not in df0.columns
+                    except Exception:
+                        need_bpxy = True
+                    if need_bpxy:
+                        try:
+                            df_new = get_1d_poloidal_data(ds0_t, params=["Bpxy"], region=region, sepadd=sepadd, target_first=False)
+                            if df_new is not None and "Bpxy" in df_new:
+                                try:
+                                    df0["Bpxy"] = df_new["Bpxy"].values
+                                except Exception:
+                                    pass
+                            self._pol_cache[ck0] = df0
+                        except Exception:
+                            pass
+                # Need geometry coordinate for the chosen x-axis.
+                if df0 is not None and "R" in df0 and ("Spar" in df0 or "Spol" in df0):
                     r = np.asarray(df0["R"].values)
-                    s = np.asarray(df0["Spar"].values)
+                    s = np.asarray(df0.get(xcol, df0.get("Spar")).values)  # type: ignore[union-attr]
                     if r.size and s.size:
-                        i0 = int(np.nanargmin(np.abs(r)))
-                        if 0 <= i0 < s.size:
-                            xline_rmin = float(s[i0])
+                        rr = np.asarray(r, dtype=float)
+                        ss = np.asarray(s, dtype=float)
+                        m = np.isfinite(rr) & np.isfinite(ss)
+                        if np.any(m):
+                            s_use = ss[m]
+                            # Prefer Bpxy minimum (in magnitude) to identify the X-point
+                            try:
+                                bp = np.asarray(df0["Bpxy"].values, dtype=float)
+                                bp_use = bp[m]
+                                mbp = np.isfinite(bp_use)
+                                if np.any(mbp):
+                                    bp2 = np.asarray(bp_use[mbp], dtype=float)
+                                    s2 = np.asarray(s_use[mbp], dtype=float)
+                                    # Avoid false minima at the targets by searching only the middle 75%
+                                    n2 = int(bp2.size)
+                                    lo = int(np.floor(0.125 * n2))
+                                    hi = int(np.ceil(0.875 * n2))
+                                    if hi <= lo:
+                                        lo, hi = 0, n2
+                                    bp_mid = bp2[lo:hi]
+                                    s_mid = s2[lo:hi]
+                                    if bp_mid.size:
+                                        jmid = int(np.nanargmin(np.abs(bp_mid)))
+                                        jmid = int(np.clip(jmid, 0, bp_mid.size - 1))
+                                        xline_rmin = float(s_mid[jmid])
+                            except Exception:
+                                # Fallback: previous heuristic (closest-to-zero R)
+                                try:
+                                    rr_use = rr[m]
+                                    j0 = int(np.nanargmin(np.abs(rr_use)))
+                                    if 0 <= j0 < s_use.size:
+                                        xline_rmin = float(s_use[j0])
+                                except Exception:
+                                    pass
         except Exception:
             xline_rmin = None
 
@@ -2639,19 +3080,42 @@ class Hermes3QtMainWindow(QMainWindow):
         for c in self.cases.values():
             ds_t = self._ds_at_time(c)
             ti = self._get_time_index_for_case(c)
-            ck = (c.label, ti, region, sepadd, tuple(vars_to_plot))
+            # Incremental cache: keep one df per (case,time,region,sepadd) and extend
+            ck = (c.label, ti, region, sepadd)
             df = self._pol_cache.get(ck)
+            params = _selector_params_only(list(vars_to_plot))
             if df is None:
                 try:
-                    df = get_1d_poloidal_data(ds_t, params=list(vars_to_plot), region=region, sepadd=sepadd, target_first=False)
+                    df = get_1d_poloidal_data(ds_t, params=list(params), region=region, sepadd=sepadd, target_first=False)
                 except Exception as e:
                     self.set_status(f"Poloidal extract failed: {e}", is_error=True)
                     df = None
                 self._pol_cache[ck] = df
+            else:
+                try:
+                    missing = [v for v in params if v not in df.columns]
+                except Exception:
+                    missing = list(params)
+                if missing:
+                    try:
+                        df_new = get_1d_poloidal_data(ds_t, params=list(missing), region=region, sepadd=sepadd, target_first=False)
+                        # Merge missing columns by index (same length/order expected)
+                        for v in list(missing):
+                            if v in df_new:
+                                try:
+                                    df[v] = df_new[v].values
+                                except Exception:
+                                    pass
+                        self._pol_cache[ck] = df
+                    except Exception as e:
+                        self.set_status(f"Poloidal extract failed: {e}", is_error=True)
             if df is None:
                 continue
 
-            x = np.asarray(df["Spar"].values)
+            try:
+                x = np.asarray(df.get(xcol, df.get("Spar")).values)  # type: ignore[union-attr]
+            except Exception:
+                x = np.asarray(df["Spar"].values)
             for ax, name in zip(axes, vars_to_plot):
                 ax.set_title(f"{name} ({region}, sepadd={sepadd})", fontsize=10)
                 ax.grid(True, alpha=0.3)
@@ -2678,7 +3142,7 @@ class Hermes3QtMainWindow(QMainWindow):
             ax.set_ylabel(f"{units}" if units else "")
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
-            ax.set_xlabel(r"S$_\parallel$ (m)")
+            ax.set_xlabel(xlab)
             if xline_rmin is not None and np.isfinite(xline_rmin):
                 try:
                     ax.axvline(xline_rmin, color="k", linewidth=1.0, linestyle="--")
@@ -2696,21 +3160,43 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            # Apply ylim mode using currently plotted data (fast)
+            # Apply ylim mode (match 1D behavior: auto/final/global)
             try:
                 ylim_mode = self._ylim_mode_by_var.get(name, "auto")
+                if ylim_mode == "global":
+                    ylim_mode = "max"
                 if ylim_mode == "auto":
                     ax.relim()
                     ax.autoscale_view()
                 else:
-                    # "final"/"global" treated as fixed-to-current for these derived lines
-                    ax.relim()
-                    ax.autoscale_view()
+                    c0 = self._primary_case()
+                    if c0 is not None:
+                        ymin, ymax = self._compute_ylim_poloidal_extracted(
+                            case=c0,
+                            region=region,
+                            sepadd=sepadd,
+                            varname=name,
+                            yscale=self._yscale_by_var.get(name, "linear"),
+                            mode=ylim_mode,
+                            get_1d_poloidal_data=get_1d_poloidal_data,
+                        )
+                        if ymin is not None and ymax is not None:
+                            ax.set_ylim(ymin, ymax)
             except Exception:
                 pass
 
         # Overlay buttons for yscale/ylim (same as 1D)
         self._sync_overlay_buttons_pol(vars_to_plot=vars_to_plot, axes=axes)
+        # Ensure toolbar Home resets to the default view (not the preserved zoom)
+        try:
+            self._reset_toolbar_home(getattr(self, "pol_toolbar", None))
+        except Exception:
+            pass
+        # Restore user zoom/pan (if applicable)
+        try:
+            self._restore_view_2d(views=_view_restore, vars_to_plot=vars_to_plot, axes=axes)
+        except Exception:
+            pass
         try:
             self.pol_figure.tight_layout()
         except Exception:
@@ -2721,6 +3207,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self._update_time_readout()
 
         # If nothing relevant changed since last draw, don't rebuild the figure.
+        _view_restore = None
         try:
             case = self._primary_case()
             ti = self._get_time_index_for_case(case) if case else -1
@@ -2735,6 +3222,9 @@ class Hermes3QtMainWindow(QMainWindow):
                     pass
                 self.rad_canvas.draw_idle()
                 return
+            # Preserve zoom/pan across time changes (same config, different ti)
+            state_no_ti = ("rad", getattr(case, "label", None), region, vars_to_plot, modes)
+            _view_restore = self._maybe_capture_view_2d(kind="rad", state_key_no_ti=state_no_ti)
             self._last_draw_state_2d["rad"] = state_key
         except Exception:
             pass
@@ -2805,19 +3295,39 @@ class Hermes3QtMainWindow(QMainWindow):
         for c in self.cases.values():
             ds_t = self._ds_at_time(c)
             ti = self._get_time_index_for_case(c)
-            ck = (c.label, ti, region, tuple(vars_to_plot))
+            # Incremental cache: keep one df per (case,time,region) and extend
+            ck = (c.label, ti, region)
             df = self._rad_cache.get(ck)
+            params = _selector_params_only(list(vars_to_plot))
             if df is None:
                 try:
-                    df = get_1d_radial_data(ds_t, params=list(vars_to_plot), region=region, guards=False, sol=True, core=True)
+                    df = get_1d_radial_data(ds_t, params=list(params), region=region, guards=False, sol=True, core=True)
                 except Exception as e:
                     self.set_status(f"Radial extract failed: {e}", is_error=True)
                     df = None
                 self._rad_cache[ck] = df
+            else:
+                try:
+                    missing = [v for v in params if v not in df.columns]
+                except Exception:
+                    missing = list(params)
+                if missing:
+                    try:
+                        df_new = get_1d_radial_data(ds_t, params=list(missing), region=region, guards=False, sol=True, core=True)
+                        for v in list(missing):
+                            if v in df_new:
+                                try:
+                                    df[v] = df_new[v].values
+                                except Exception:
+                                    pass
+                        self._rad_cache[ck] = df
+                    except Exception as e:
+                        self.set_status(f"Radial extract failed: {e}", is_error=True)
             if df is None:
                 continue
 
-            x = np.asarray(df["Srad"].values)
+            # Plot radial coordinate in mm
+            x = np.asarray(df["Srad"].values) * 1e3
             for ax, name in zip(axes, vars_to_plot):
                 ax.set_title(f"{name} ({region})", fontsize=10)
                 ax.grid(True, alpha=0.3)
@@ -2843,7 +3353,7 @@ class Hermes3QtMainWindow(QMainWindow):
             ax.set_ylabel(f"{units}" if units else "")
             if len(self.cases) > 1:
                 ax.legend(loc="best", fontsize=8)
-            ax.set_xlabel(r"$r^\prime - r_{sep}$ (m)")
+            ax.set_xlabel(r"$r^\prime - r_{sep}$ (mm)")
             # Separatrix marker
             try:
                 ax.axvline(0.0, color="k", linestyle="--", linewidth=1.0)
@@ -2863,16 +3373,38 @@ class Hermes3QtMainWindow(QMainWindow):
 
             try:
                 ylim_mode = self._ylim_mode_by_var.get(name, "auto")
+                if ylim_mode == "global":
+                    ylim_mode = "max"
                 if ylim_mode == "auto":
                     ax.relim()
                     ax.autoscale_view()
                 else:
-                    ax.relim()
-                    ax.autoscale_view()
+                    c0 = self._primary_case()
+                    if c0 is not None:
+                        ymin, ymax = self._compute_ylim_radial_extracted(
+                            case=c0,
+                            region=region,
+                            varname=name,
+                            yscale=self._yscale_by_var.get(name, "linear"),
+                            mode=ylim_mode,
+                            get_1d_radial_data=get_1d_radial_data,
+                        )
+                        if ymin is not None and ymax is not None:
+                            ax.set_ylim(ymin, ymax)
             except Exception:
                 pass
 
         self._sync_overlay_buttons_rad(vars_to_plot=vars_to_plot, axes=axes)
+        # Ensure toolbar Home resets to the default view (not the preserved zoom)
+        try:
+            self._reset_toolbar_home(getattr(self, "rad_toolbar", None))
+        except Exception:
+            pass
+        # Restore user zoom/pan (if applicable)
+        try:
+            self._restore_view_2d(views=_view_restore, vars_to_plot=vars_to_plot, axes=axes)
+        except Exception:
+            pass
         try:
             self.rad_figure.tight_layout()
         except Exception:
@@ -3002,7 +3534,9 @@ class Hermes3QtMainWindow(QMainWindow):
         try:
             case = self._primary_case()
             sepadd = int(self.pol_sepadd_spin.value()) if hasattr(self, "pol_sepadd_spin") else 0
-            state_key = ("mon", getattr(case, "label", None), sepadd)
+            region = str(self.pol_region_combo.currentText() or "outer_lower") if hasattr(self, "pol_region_combo") else "outer_lower"
+            vars_to_plot = tuple(self.selected_vars)
+            state_key = ("mon", getattr(case, "label", None), sepadd, region, vars_to_plot)
             if self._last_draw_state_2d.get("mon") == state_key and self.mon_figure.axes:
                 self.mon_canvas.draw_idle()
                 return
@@ -3021,6 +3555,14 @@ class Hermes3QtMainWindow(QMainWindow):
             ax = self.mon_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            self.mon_canvas.draw_idle()
+            return
+
+        vars_to_plot = list(self.selected_vars)
+        if not vars_to_plot:
+            ax = self.mon_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "No variables selected.", ha="center", va="center", transform=ax.transAxes)
             self.mon_canvas.draw_idle()
             return
 
@@ -3049,15 +3591,13 @@ class Hermes3QtMainWindow(QMainWindow):
         except Exception:
             t_ms = np.arange(case.n_time)
 
-        region = "outer_lower"
+        region = str(self.pol_region_combo.currentText() or "outer_lower") if hasattr(self, "pol_region_combo") else "outer_lower"
         sepadd = int(self.pol_sepadd_spin.value()) if hasattr(self, "pol_sepadd_spin") else 0
-        ck = (case.label, region, sepadd)
+        ck = (case.label, region, sepadd, tuple(vars_to_plot))
         cached = self._mon_cache.get(ck)
         if cached is None:
-            Ne_omp = []
-            Te_omp = []
-            Ne_targ = []
-            Te_targ = []
+            omp = np.full((int(case.n_time), len(vars_to_plot)), np.nan, dtype=float)
+            targ = np.full((int(case.n_time), len(vars_to_plot)), np.nan, dtype=float)
 
             def _slice_with_metadata(i: int):
                 try:
@@ -3084,60 +3624,88 @@ class Hermes3QtMainWindow(QMainWindow):
             for i in range(int(case.n_time)):
                 dsi = _slice_with_metadata(i)
                 try:
-                    df = get_1d_poloidal_data(dsi, params=["Ne", "Te"], region=region, sepadd=sepadd, target_first=False)
-                    Ne = np.asarray(df["Ne"].values)
-                    Te = np.asarray(df["Te"].values)
-                    # user rule: OMP is first index; target is 2nd-to-last
-                    Ne_omp.append(float(Ne[0]) if Ne.size else np.nan)
-                    Te_omp.append(float(Te[0]) if Te.size else np.nan)
-                    if Ne.size >= 2:
-                        Ne_targ.append(float(Ne[-2]))
-                        Te_targ.append(float(Te[-2]))
-                    else:
-                        Ne_targ.append(np.nan)
-                        Te_targ.append(np.nan)
+                    params = _selector_params_only(list(vars_to_plot))
+                    df = get_1d_poloidal_data(dsi, params=list(params), region=region, sepadd=sepadd, target_first=False)
+                    for j, name in enumerate(vars_to_plot):
+                        try:
+                            y = np.asarray(df[name].values, dtype=float)
+                        except Exception:
+                            continue
+                        if y.size:
+                            omp[i, j] = float(y[0])
+                            if y.size >= 2:
+                                targ[i, j] = float(y[-2])
                 except Exception:
-                    Ne_omp.append(np.nan)
-                    Te_omp.append(np.nan)
-                    Ne_targ.append(np.nan)
-                    Te_targ.append(np.nan)
+                    continue
 
-            Ne_omp = np.asarray(Ne_omp, dtype=float)
-            Te_omp = np.asarray(Te_omp, dtype=float)
-            Ne_targ = np.asarray(Ne_targ, dtype=float)
-            Te_targ = np.asarray(Te_targ, dtype=float)
-            self._mon_cache[ck] = (t_ms, Ne_omp, Te_omp, Ne_targ, Te_targ)
+            self._mon_cache[ck] = (t_ms, omp, targ, tuple(vars_to_plot))
             cached = self._mon_cache[ck]
 
-        t_ms, Ne_omp, Te_omp, Ne_targ, Te_targ = cached
+        t_ms, omp, targ, vorder = cached
+        vorder = list(vorder)
 
-        gs = self.mon_figure.add_gridspec(nrows=2, ncols=2, hspace=0.35, wspace=0.30)
-        ax00 = self.mon_figure.add_subplot(gs[0, 0])
-        ax01 = self.mon_figure.add_subplot(gs[0, 1], sharex=ax00)
-        ax10 = self.mon_figure.add_subplot(gs[1, 0], sharex=ax00)
-        ax11 = self.mon_figure.add_subplot(gs[1, 1], sharex=ax00)
+        n = len(vorder)
+        # Arrange as 2 rows x N columns:
+        #   top row   -> OMP
+        #   bottom row-> target
+        gs = self.mon_figure.add_gridspec(nrows=2, ncols=max(1, n), hspace=0.45, wspace=0.35)
+        ax_omp = []
+        ax_targ = []
+        for i in range(max(1, n)):
+            if i == 0:
+                a0 = self.mon_figure.add_subplot(gs[0, i])
+                a1 = self.mon_figure.add_subplot(gs[1, i], sharex=a0)
+            else:
+                a0 = self.mon_figure.add_subplot(gs[0, i], sharex=ax_omp[0])
+                a1 = self.mon_figure.add_subplot(gs[1, i], sharex=ax_omp[0])
+            ax_omp.append(a0)
+            ax_targ.append(a1)
 
-        def _plot(ax, y, title):
-            ax.set_title(title, fontsize=10)
-            ax.grid(True, alpha=0.3)
-            if y is None:
-                ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
-                return
-            y = np.asarray(y, dtype=float)
-            if not np.any(np.isfinite(y)):
-                ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
-                return
-            ax.plot(t_ms[: len(y)], y, lw=1.5)
+        for i, name in enumerate(vorder):
+            a0 = ax_omp[i]
+            a1 = ax_targ[i]
+            a0.set_title(f"{name} (OMP)", fontsize=10)
+            a1.set_title(f"{name} (target)", fontsize=10)
+            for ax in (a0, a1):
+                ax.grid(True, alpha=0.3)
 
-        _plot(ax00, Ne_omp, r"$N_e^{omp}$")
-        _plot(ax01, Te_omp, r"$T_e^{omp}$")
-        _plot(ax10, Ne_targ, r"$N_e^{targ}$")
-        _plot(ax11, Te_targ, r"$T_e^{targ}$")
+            y0 = np.asarray(omp[:, i], dtype=float)
+            y1 = np.asarray(targ[:, i], dtype=float)
+            if self._yscale_by_var.get(name, "linear") == "log":
+                y0 = np.where(y0 > 0, y0, np.nan)
+                y1 = np.where(y1 > 0, y1, np.nan)
+            a0.plot(t_ms[: len(y0)], y0, lw=1.2)
+            a1.plot(t_ms[: len(y1)], y1, lw=1.2)
 
-        for ax in (ax10, ax11):
+            # Apply y-scale mode (re-using the same per-variable setting as other tabs)
+            mode = self._yscale_by_var.get(name, "linear")
+            for ax in (a0, a1):
+                try:
+                    if mode == "log":
+                        ax.set_yscale("log")
+                    elif mode == "symlog":
+                        ax.set_yscale("symlog", linthresh=1e-6)
+                    else:
+                        ax.set_yscale("linear")
+                except Exception:
+                    pass
+
+            # Units (if known)
+            units = None
+            try:
+                if name in ds:
+                    units = ds[name].attrs.get("units", None)
+            except Exception:
+                units = None
+            yl = f"{units}" if units else ""
+            a0.set_ylabel(yl)
+            a1.set_ylabel(yl)
+
+        # X labels only on bottom row
+        for ax in ax_targ:
             ax.set_xlabel("Time (ms)")
 
-        self.mon_figure.suptitle(f"{case.label} monitor", fontsize=12)
+        # No suptitle (save vertical space)
         try:
             self.mon_figure.tight_layout()
         except Exception:
@@ -3150,6 +3718,22 @@ class Hermes3QtMainWindow(QMainWindow):
             return
 
         self._update_time_readout()
+
+        # Preserve toolbar zoom/pan across time changes (same config, different ti)
+        _view_restore_1d = None
+        try:
+            sdim0 = self.state.get("spatial_dim")
+            vars0 = tuple(self.selected_vars)
+            modes0 = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars0)
+            guard0 = bool(self._guard_replace_enabled())
+            case_labels0 = tuple(self.cases.keys())
+            ti0 = int(self._get_time_index())
+            state_key = ("prof", case_labels0, ti0, sdim0, vars0, modes0, guard0)
+            state_no_ti = ("prof", case_labels0, sdim0, vars0, modes0, guard0)
+            _view_restore_1d = self._maybe_capture_view_1d(state_key_no_ti=state_no_ti)
+            self._last_draw_state_1d_profiles = state_key
+        except Exception:
+            _view_restore_1d = None
 
         self.figure.clear()
         # Explicit facecolor to avoid inheriting dark appearances on some platforms.
@@ -3345,7 +3929,7 @@ class Hermes3QtMainWindow(QMainWindow):
                     else:
                         ax.relim()
                         ax.autoscale_view()
-                elif ylim_mode == "global":
+                elif ylim_mode == "global" or ylim_mode == "max":
                     ymin, ymax = self._compute_ylim_for_global(name, mode)
                     if ymin is not None and ymax is not None:
                         ax.set_ylim(ymin, ymax)
@@ -3364,6 +3948,16 @@ class Hermes3QtMainWindow(QMainWindow):
 
         # Sync overlay buttons to the current subplot grid.
         self._sync_overlay_buttons(vars_to_plot=vars_to_plot, axes=axes)
+        # Ensure toolbar Home resets to the default view (not the preserved zoom)
+        try:
+            self._reset_toolbar_home(getattr(self, "toolbar", None))
+        except Exception:
+            pass
+        # Restore user zoom/pan if applicable
+        try:
+            self._restore_view_2d(views=_view_restore_1d, vars_to_plot=vars_to_plot, axes=axes)
+        except Exception:
+            pass
         self.canvas.draw_idle()
 
     # ---------- Time history plotting ----------
