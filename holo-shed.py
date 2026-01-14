@@ -26,6 +26,7 @@ from matplotlib import rcParams  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar  # noqa: E402
+from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
 
 
 def _infer_time_dim(ds) -> Optional[str]:
@@ -227,6 +228,11 @@ def _pick_bout_output_for_probe(case_dir: Path) -> Path:
     if squash.exists():
         return squash
 
+    # Some workflows produce a single combined file under this name
+    dmp_single = case_dir / "BOUT.dmp.nc"
+    if dmp_single.exists():
+        return dmp_single
+
     # Prefer the first dump file if present (common naming)
     d0 = case_dir / "BOUT.dmp.0.nc"
     if d0.exists():
@@ -238,8 +244,38 @@ def _pick_bout_output_for_probe(case_dir: Path) -> Path:
         return dmps[0]
 
     raise FileNotFoundError(
-        f"Could not find BOUT output in {case_dir} (expected BOUT.squash.nc or BOUT.dmp.*.nc)."
+        f"Could not find BOUT output in {case_dir} (expected BOUT.squash.nc, BOUT.dmp.nc, or BOUT.dmp.*.nc)."
     )
+
+
+def _should_use_squash_for_load(case_dir: Path) -> bool:
+    """
+    Decide whether to ask sdtools to use (or create) BOUT.squash.nc.
+
+    User preference: always use squash for multi-file outputs, because even
+    ~20 dump files can be a noticeable slowdown.
+
+    Notes:
+    - If BOUT.squash.nc already exists, always use it.
+    - If we have per-timestep files (BOUT.dmp.*.nc), always use/create squash.
+    - If the case already has a single combined file (e.g. BOUT.dmp.nc) and no
+      per-timestep files, we skip squash (already fast, and squash tooling may
+      assume BOUT.dmp.*.nc exists).
+    """
+    try:
+        if (case_dir / "BOUT.squash.nc").exists():
+            return True
+    except Exception:
+        pass
+
+    # Any per-timestep dump files -> always squash
+    try:
+        for _ in case_dir.glob("BOUT.dmp.*.nc"):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _probe_is_2d_case(case_dir: Path) -> bool:
@@ -688,6 +724,11 @@ class Hermes3QtMainWindow(QMainWindow):
         # 2D polygon colorbar limits are only applied when user confirms
         self._poly_vmin_active: Optional[float] = None
         self._poly_vmax_active: Optional[float] = None
+        # 2D polygon artist reuse (fast time slider updates)
+        self._poly_plot_state: Optional[tuple] = None
+        self._poly_ax = None
+        self._poly_polys = None
+        self._poly_cbar = None
 
         # 2D time-slider redraw throttle (keeps dragging responsive)
         self._time2d_redraw_timer = QTimer(self)
@@ -1866,6 +1907,7 @@ class Hermes3QtMainWindow(QMainWindow):
         # Add a fallback path so loading a 2D case while in "1D mode" (or vice versa)
         # still works and automatically switches the GUI after load.
         is_2d_probe = _probe_is_2d_case(case_dir)
+        use_squash = _should_use_squash_for_load(case_dir)
 
         def _load_2d():
             # For now assume the grid file lives alongside the case output.
@@ -1885,7 +1927,13 @@ class Hermes3QtMainWindow(QMainWindow):
                     f"  grid: {grid_path}\n"
                     f"  case: {case_dir}"
                 )
-            cs2 = self.Load.case_2D(case_path, gridfilepath=str(grid_path), verbose=False)
+            cs2 = self.Load.case_2D(
+                case_path,
+                gridfilepath=str(grid_path),
+                verbose=False,
+                use_squash=use_squash,
+                force_squash=False,
+            )
             try:
                 _ensure_sdtools_2d_metadata(cs2.ds)
             except Exception:
@@ -1895,7 +1943,13 @@ class Hermes3QtMainWindow(QMainWindow):
         def _load_1d():
             # Newer xHermes versions may not provide ds.hermes.guard_replace_1d(),
             # which sdtools tries to call when guard_replace=True. Disable it here.
-            return self.Load.case_1D(case_path, verbose=False, guard_replace=False)
+            return self.Load.case_1D(
+                case_path,
+                verbose=False,
+                guard_replace=False,
+                use_squash=use_squash,
+                force_squash=False,
+            )
 
         cs = None
         is_2d = False
@@ -2595,31 +2649,9 @@ class Hermes3QtMainWindow(QMainWindow):
     def _redraw_2d_polygon(self) -> None:
         self._update_time_readout()
 
-        # If nothing relevant changed since last draw, don't rebuild the figure.
-        try:
-            case = self._primary_case()
-            ti = self._get_time_index_for_case(case) if case else -1
-            var = str(self.poly_var_combo.currentText() or "").strip()
-            grid_only = bool(self.poly_grid_only_check.isChecked())
-            logscale = bool(self.poly_log_check.isChecked())
-            vmin = _parse_optional_float(self.poly_vmin_edit.text())
-            vmax = _parse_optional_float(self.poly_vmax_edit.text())
-            state_key = ("poly", getattr(case, "label", None), ti, var, grid_only, logscale, vmin, vmax)
-            if self._last_draw_state_2d.get("poly") == state_key and self.poly_figure.axes:
-                self.poly_canvas.draw_idle()
-                return
-            self._last_draw_state_2d["poly"] = state_key
-        except Exception:
-            pass
-
-        self.poly_figure.clear()
-        try:
-            self.poly_figure.set_facecolor("white")
-        except Exception:
-            pass
-
         case = self._primary_case()
         if case is None:
+            self.poly_figure.clear()
             ax = self.poly_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
@@ -2628,6 +2660,7 @@ class Hermes3QtMainWindow(QMainWindow):
 
         var = str(self.poly_var_combo.currentText() or "").strip()
         if not var:
+            self.poly_figure.clear()
             ax = self.poly_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "Select a variable.", ha="center", va="center", transform=ax.transAxes)
@@ -2635,11 +2668,38 @@ class Hermes3QtMainWindow(QMainWindow):
             return
 
         ds_t = self._ds_at_time(case)
+        grid_only = bool(self.poly_grid_only_check.isChecked())
+        logscale = bool(self.poly_log_check.isChecked())
+        vmin = self._poly_vmin_active
+        vmax = self._poly_vmax_active
+
+        # Reuse the PatchCollection when only time index changes (fast).
+        state = (case.label, var, grid_only, logscale, vmin, vmax)
+        if self._poly_plot_state == state and self._poly_ax is not None and self._poly_polys is not None:
+            try:
+                data = ds_t[var].hermesm.clean_guards()
+                self._poly_polys.set_array(np.asarray(data.data).flatten())
+                if self._poly_cbar is not None:
+                    try:
+                        self._poly_cbar.update_normal(self._poly_polys)
+                    except Exception:
+                        pass
+                self.poly_canvas.draw_idle()
+                return
+            except Exception:
+                # fall through to rebuild
+                pass
+
+        # Otherwise rebuild the plot (variable/settings changed)
+        self.poly_figure.clear()
+        try:
+            self.poly_figure.set_facecolor("white")
+        except Exception:
+            pass
         ax = self.poly_figure.add_subplot(1, 1, 1)
         try:
             data = ds_t[var]
             # Clean guards for nicer visuals and use xbout polygon plotting
-            grid_only = bool(self.poly_grid_only_check.isChecked())
             if grid_only:
                 data.hermesm.clean_guards().bout.polygon(
                     ax=ax,
@@ -2653,13 +2713,6 @@ class Hermes3QtMainWindow(QMainWindow):
                 )
                 ax.set_title("Computational grid", fontsize=11)
             else:
-                vmin = self._poly_vmin_active
-                vmax = self._poly_vmax_active
-                logscale = False
-                try:
-                    logscale = bool(self.poly_log_check.isChecked())
-                except Exception:
-                    logscale = False
                 data.hermesm.clean_guards().bout.polygon(
                     ax=ax,
                     cmap="Spectral_r",
@@ -2673,12 +2726,42 @@ class Hermes3QtMainWindow(QMainWindow):
                     separatrix=True,
                     separatrix_kwargs={"linewidth": 0.2, "color": "k"},
                     targets=False,
-                    add_colorbar=True,
+                    add_colorbar=False,
                 )
                 ax.set_title(f"{var}", fontsize=11)
+                # Create and keep our own colorbar so we can update it efficiently
+                try:
+                    polys = ax.collections[-1] if ax.collections else None
+                    if polys is not None:
+                        divider = make_axes_locatable(ax)
+                        cax = divider.append_axes("right", size="5%", pad=0.05)
+                        label = ""
+                        try:
+                            label = var
+                            if "units" in data.attrs:
+                                label = f"{label} [{data.attrs['units']}]"
+                        except Exception:
+                            pass
+                        self._poly_cbar = self.poly_figure.colorbar(polys, cax=cax, label=label)
+                        try:
+                            cax.grid(which="both", visible=False)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception as e:
             ax.set_axis_off()
             ax.text(0.5, 0.5, f"2D plot failed:\n{e}", ha="center", va="center", transform=ax.transAxes)
+        # Save handles for fast time updates
+        try:
+            self._poly_plot_state = state
+            self._poly_ax = ax
+            self._poly_polys = ax.collections[-1] if ax.collections else None
+        except Exception:
+            self._poly_plot_state = None
+            self._poly_ax = None
+            self._poly_polys = None
+            self._poly_cbar = None
         self.poly_canvas.draw_idle()
 
     def _redraw_2d_monitor(self) -> None:
