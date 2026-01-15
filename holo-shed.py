@@ -1160,7 +1160,18 @@ class Hermes3QtMainWindow(QMainWindow):
         mon_ctrl_layout = QVBoxLayout(self._mon_ctrl_tab)
         mon_ctrl_layout.setContentsMargins(6, 6, 6, 6)
         mon_ctrl_layout.setSpacing(6)
-        mon_ctrl_layout.addWidget(QLabel("Time history at OMP + target (from selected variables)"))
+        mon_ctrl_layout.addWidget(QLabel("Time history at midplane + target (from selected variables)"))
+
+        th_region_row = QHBoxLayout()
+        th_region_row.addWidget(QLabel("region"))
+        self.timehist_region_combo = QComboBox()
+        self.timehist_region_combo.addItems(["outer_lower", "outer_upper", "inner_lower", "inner_upper"])
+        try:
+            self.timehist_region_combo.setCurrentText("outer_lower")
+        except Exception:
+            pass
+        th_region_row.addWidget(self.timehist_region_combo, 1)
+        mon_ctrl_layout.addLayout(th_region_row)
         mon_ctrl_layout.addStretch(1)
 
         # Right panel
@@ -1318,6 +1329,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.pol_show_region2d_check.toggled.connect(self._on_pol_show_region2d_toggled)
         self.rad_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.rad_show_region2d_check.toggled.connect(self._on_rad_show_region2d_toggled)
+        self.timehist_region_combo.currentIndexChanged.connect(lambda _i: self.request_time_history_redraw())
         self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_grid_only_check.toggled.connect(lambda _v: self.request_redraw())
         self.poly_log_check.toggled.connect(lambda _v: self.request_redraw())
@@ -3347,6 +3359,8 @@ class Hermes3QtMainWindow(QMainWindow):
             pass
 
         if not self.cases:
+            # No plots -> no overlay buttons
+            self._clear_overlay_buttons_pol()
             ax = self.pol_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
@@ -3355,6 +3369,8 @@ class Hermes3QtMainWindow(QMainWindow):
 
         vars_to_plot = list(self.selected_vars)
         if not vars_to_plot:
+            # No plots -> no overlay buttons
+            self._clear_overlay_buttons_pol()
             ax = self.pol_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "No variables selected.", ha="center", va="center", transform=ax.transAxes)
@@ -3674,6 +3690,8 @@ class Hermes3QtMainWindow(QMainWindow):
             pass
 
         if not self.cases:
+            # No plots -> no overlay buttons
+            self._clear_overlay_buttons_rad()
             ax = self.rad_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
@@ -3682,6 +3700,8 @@ class Hermes3QtMainWindow(QMainWindow):
 
         vars_to_plot = list(self.selected_vars)
         if not vars_to_plot:
+            # No plots -> no overlay buttons
+            self._clear_overlay_buttons_rad()
             ax = self.rad_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
             ax.text(0.5, 0.5, "No variables selected.", ha="center", va="center", transform=ax.transAxes)
@@ -3972,7 +3992,11 @@ class Hermes3QtMainWindow(QMainWindow):
         try:
             case = self._primary_case()
             sepadd = int(self.pol_sepadd_spin.value()) if hasattr(self, "pol_sepadd_spin") else 0
-            region = str(self.pol_region_combo.currentText() or "outer_lower") if hasattr(self, "pol_region_combo") else "outer_lower"
+            region = (
+                str(self.timehist_region_combo.currentText() or "outer_lower")
+                if hasattr(self, "timehist_region_combo")
+                else "outer_lower"
+            )
             vars_to_plot = tuple(self.selected_vars)
             state_key = ("mon", getattr(case, "label", None), sepadd, region, vars_to_plot)
             if self._last_draw_state_2d.get("mon") == state_key and self.mon_figure.axes:
@@ -4029,7 +4053,11 @@ class Hermes3QtMainWindow(QMainWindow):
         except Exception:
             t_ms = np.arange(case.n_time)
 
-        region = str(self.pol_region_combo.currentText() or "outer_lower") if hasattr(self, "pol_region_combo") else "outer_lower"
+        region = (
+            str(self.timehist_region_combo.currentText() or "outer_lower")
+            if hasattr(self, "timehist_region_combo")
+            else "outer_lower"
+        )
         sepadd = int(self.pol_sepadd_spin.value()) if hasattr(self, "pol_sepadd_spin") else 0
         ck = (case.label, region, sepadd, tuple(vars_to_plot))
         cached = self._mon_cache.get(ck)
@@ -4099,11 +4127,14 @@ class Hermes3QtMainWindow(QMainWindow):
             ax_omp.append(a0)
             ax_targ.append(a1)
 
+        mid_label = "omp" if str(region).startswith("outer") else "imp"
+        tgt_label = f"{region}_target"
+
         for i, name in enumerate(vorder):
             a0 = ax_omp[i]
             a1 = ax_targ[i]
-            a0.set_title(f"{name} (OMP)", fontsize=10)
-            a1.set_title(f"{name} (target)", fontsize=10)
+            a0.set_title(f"{name} ({mid_label})", fontsize=10)
+            a1.set_title(f"{name} ({tgt_label})", fontsize=10)
             for ax in (a0, a1):
                 ax.grid(True, alpha=0.3)
 
