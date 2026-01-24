@@ -1075,7 +1075,7 @@ class Hermes3QtMainWindow(QMainWindow):
         pol_ctrl_layout = QVBoxLayout(self._pol_ctrl_tab)
         pol_ctrl_layout.setContentsMargins(6, 6, 6, 6)
         pol_ctrl_layout.setSpacing(6)
-        pol_ctrl_layout.addWidget(QLabel("Poloidal 1D (SOL ring)"))
+        pol_ctrl_layout.addWidget(QLabel("Poloidal 1D (SOL ring)\nShift+right-click subplot for context options."))
         pol_region_row = QHBoxLayout()
         pol_region_row.addWidget(QLabel("region"))
         self.pol_region_combo = QComboBox()
@@ -1116,7 +1116,7 @@ class Hermes3QtMainWindow(QMainWindow):
         rad_ctrl_layout = QVBoxLayout(self._rad_ctrl_tab)
         rad_ctrl_layout.setContentsMargins(6, 6, 6, 6)
         rad_ctrl_layout.setSpacing(6)
-        rad_ctrl_layout.addWidget(QLabel("Radial 1D"))
+        rad_ctrl_layout.addWidget(QLabel("Radial 1D\nShift+right-click subplot for context options."))
         rad_region_row = QHBoxLayout()
         rad_region_row.addWidget(QLabel("region"))
         self.rad_region_combo = QComboBox()
@@ -2000,6 +2000,10 @@ class Hermes3QtMainWindow(QMainWindow):
             self._overlay_vars[target_var] = []
         if new_var not in self._overlay_vars[target_var]:
             self._overlay_vars[target_var].append(new_var)
+        # Reset y-limits to auto so the subplot rescales to show all variables
+        self._ylim_mode_by_var[target_var] = "auto"
+        self._refresh_var_item(target_var)
+        self._refresh_overlay_button_labels(target_var)
         self.request_redraw()
 
     def _remove_overlay_from_subplot(self, overlay_var: str, target_var: str) -> None:
@@ -2009,6 +2013,10 @@ class Hermes3QtMainWindow(QMainWindow):
                 self._overlay_vars[target_var].remove(overlay_var)
             if not self._overlay_vars[target_var]:
                 del self._overlay_vars[target_var]
+        # Reset y-limits to auto so the subplot rescales
+        self._ylim_mode_by_var[target_var] = "auto"
+        self._refresh_var_item(target_var)
+        self._refresh_overlay_button_labels(target_var)
         self.request_redraw()
 
     def _remove_subplot_var(self, varname: str) -> None:
@@ -2846,26 +2854,29 @@ class Hermes3QtMainWindow(QMainWindow):
         self._active_time_readout().setText(idx_txt)
 
     def _compute_ylim_for_final(self, varname: str, tdim: Optional[str], yscale: str) -> Tuple[Optional[float], Optional[float]]:
+        # Include overlay variables in the y-limit calculation
+        all_vars = [varname] + list(self._overlay_vars.get(varname, []))
         ys_all = []
         for c in self.cases.values():
             ds = c.ds
-            if varname not in ds:
-                continue
-            da = ds[varname]
-            try:
-                final_ti = c.n_time - 1
-                if tdim is not None and tdim in da.dims:
-                    da1 = da.isel({tdim: final_ti})
-                else:
-                    da1 = da
-                yv = np.asarray(da1.values)
-                yv = yv[np.isfinite(yv)]
-                if yscale == "log":
-                    yv = yv[yv > 0]
-                if yv.size:
-                    ys_all.append(yv)
-            except Exception:
-                continue
+            for vname in all_vars:
+                if vname not in ds:
+                    continue
+                da = ds[vname]
+                try:
+                    final_ti = c.n_time - 1
+                    if tdim is not None and tdim in da.dims:
+                        da1 = da.isel({tdim: final_ti})
+                    else:
+                        da1 = da
+                    yv = np.asarray(da1.values)
+                    yv = yv[np.isfinite(yv)]
+                    if yscale == "log":
+                        yv = yv[yv > 0]
+                    if yv.size:
+                        ys_all.append(yv)
+                except Exception:
+                    continue
         if not ys_all:
             return None, None
         ys = np.concatenate(ys_all)
@@ -2876,21 +2887,24 @@ class Hermes3QtMainWindow(QMainWindow):
         return ymin - margin, ymax + margin
 
     def _compute_ylim_for_global(self, varname: str, yscale: str) -> Tuple[Optional[float], Optional[float]]:
+        # Include overlay variables in the y-limit calculation
+        all_vars = [varname] + list(self._overlay_vars.get(varname, []))
         ys_all = []
         for c in self.cases.values():
             ds = c.ds
-            if varname not in ds:
-                continue
-            da = ds[varname]
-            try:
-                yv = np.asarray(da.values)
-                yv = yv[np.isfinite(yv)]
-                if yscale == "log":
-                    yv = yv[yv > 0]
-                if yv.size:
-                    ys_all.append(yv)
-            except Exception:
-                continue
+            for vname in all_vars:
+                if vname not in ds:
+                    continue
+                da = ds[vname]
+                try:
+                    yv = np.asarray(da.values)
+                    yv = yv[np.isfinite(yv)]
+                    if yscale == "log":
+                        yv = yv[yv > 0]
+                    if yv.size:
+                        ys_all.append(yv)
+                except Exception:
+                    continue
         if not ys_all:
             return None, None
         ys = np.concatenate(ys_all)
@@ -3385,15 +3399,19 @@ class Hermes3QtMainWindow(QMainWindow):
         """
         Compute y-limits for 2D poloidal extracted 1D profiles.
         Modes match the 1D GUI: auto/final/max (legacy: global==max).
+        Includes overlay variables in the y-limit calculation.
         """
-        key = ("pol", case.label, region, int(sepadd), varname, yscale, mode, int(case.n_time))
+        # Include overlay variables in the calculation and cache key
+        overlay_vars = tuple(self._overlay_vars.get(varname, []))
+        all_vars = [varname] + list(overlay_vars)
+        key = ("pol", case.label, region, int(sepadd), varname, overlay_vars, yscale, mode, int(case.n_time))
         hit = self._pol_ylim_cache.get(key)
         if hit is not None:
             return hit
 
-        def _accum_from_df(df, cur_min, cur_max):
+        def _accum_from_df(df, vname, cur_min, cur_max):
             try:
-                y = np.asarray(df[varname].values, dtype=float)
+                y = np.asarray(df[vname].values, dtype=float)
             except Exception:
                 return cur_min, cur_max
             if yscale == "log":
@@ -3427,27 +3445,31 @@ class Hermes3QtMainWindow(QMainWindow):
             if df is None:
                 try:
                     ds_t = self._ds_at_time_index(case, int(ti))
-                    df = get_1d_poloidal_data(ds_t, params=[varname], region=region, sepadd=int(sepadd), target_first=False)
+                    df = get_1d_poloidal_data(ds_t, params=all_vars, region=region, sepadd=int(sepadd), target_first=False)
                 except Exception:
                     df = None
                 self._pol_cache[ck] = df
             else:
                 try:
-                    missing = [varname] if varname not in df.columns else []
+                    missing = [v for v in all_vars if v not in df.columns]
                 except Exception:
-                    missing = [varname]
+                    missing = all_vars
                 if missing:
                     try:
                         ds_t = self._ds_at_time_index(case, int(ti))
                         df_new = get_1d_poloidal_data(ds_t, params=missing, region=region, sepadd=int(sepadd), target_first=False)
-                        if df_new is not None and varname in df_new:
-                            df[varname] = df_new[varname].values
+                        if df_new is not None:
+                            for v in missing:
+                                if v in df_new:
+                                    df[v] = df_new[v].values
                         self._pol_cache[ck] = df
                     except Exception:
                         pass
             if df is None:
                 continue
-            ymin, ymax = _accum_from_df(df, ymin, ymax)
+            # Accumulate min/max from all variables (primary + overlays)
+            for vname in all_vars:
+                ymin, ymax = _accum_from_df(df, vname, ymin, ymax)
 
         if ymin is None or ymax is None:
             out = (None, None)
@@ -3470,15 +3492,19 @@ class Hermes3QtMainWindow(QMainWindow):
         """
         Compute y-limits for 2D radial extracted 1D profiles.
         Modes match the 1D GUI: auto/final/max (legacy: global==max).
+        Includes overlay variables in the y-limit calculation.
         """
-        key = ("rad", case.label, region, varname, yscale, mode, int(case.n_time))
+        # Include overlay variables in the calculation and cache key
+        overlay_vars = tuple(self._overlay_vars.get(varname, []))
+        all_vars = [varname] + list(overlay_vars)
+        key = ("rad", case.label, region, varname, overlay_vars, yscale, mode, int(case.n_time))
         hit = self._rad_ylim_cache.get(key)
         if hit is not None:
             return hit
 
-        def _accum_from_df(df, cur_min, cur_max):
+        def _accum_from_df(df, vname, cur_min, cur_max):
             try:
-                y = np.asarray(df[varname].values, dtype=float)
+                y = np.asarray(df[vname].values, dtype=float)
             except Exception:
                 return cur_min, cur_max
             if yscale == "log":
@@ -3511,27 +3537,31 @@ class Hermes3QtMainWindow(QMainWindow):
             if df is None:
                 try:
                     ds_t = self._ds_at_time_index(case, int(ti))
-                    df = get_1d_radial_data(ds_t, params=[varname], region=region, guards=False, sol=True, core=True)
+                    df = get_1d_radial_data(ds_t, params=all_vars, region=region, guards=False, sol=True, core=True)
                 except Exception:
                     df = None
                 self._rad_cache[ck] = df
             else:
                 try:
-                    missing = [varname] if varname not in df.columns else []
+                    missing = [v for v in all_vars if v not in df.columns]
                 except Exception:
-                    missing = [varname]
+                    missing = all_vars
                 if missing:
                     try:
                         ds_t = self._ds_at_time_index(case, int(ti))
                         df_new = get_1d_radial_data(ds_t, params=missing, region=region, guards=False, sol=True, core=True)
-                        if df_new is not None and varname in df_new:
-                            df[varname] = df_new[varname].values
+                        if df_new is not None:
+                            for v in missing:
+                                if v in df_new:
+                                    df[v] = df_new[v].values
                         self._rad_cache[ck] = df
                     except Exception:
                         pass
             if df is None:
                 continue
-            ymin, ymax = _accum_from_df(df, ymin, ymax)
+            # Accumulate min/max from all variables (primary + overlays)
+            for vname in all_vars:
+                ymin, ymax = _accum_from_df(df, vname, ymin, ymax)
 
         if ymin is None or ymax is None:
             out = (None, None)
@@ -3610,7 +3640,9 @@ class Hermes3QtMainWindow(QMainWindow):
             xpt_mode = str(getattr(self, "pol_xpoint_combo", None).currentText() or "Bpxy valley") if hasattr(self, "pol_xpoint_combo") else "Bpxy valley"
             vars_to_plot = tuple(self.selected_vars)
             modes = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
-            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, use_spol, xpt_mode, vars_to_plot, modes)
+            # Include overlay variables in state key so view isn't restored when overlays change
+            overlays = tuple((v, tuple(self._overlay_vars.get(v, []))) for v in vars_to_plot)
+            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, use_spol, xpt_mode, vars_to_plot, modes, overlays)
             if self._last_draw_state_2d.get("pol") == state_key and self.pol_figure.axes:
                 try:
                     self._position_overlay_buttons_pol()
@@ -3619,7 +3651,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 self.pol_canvas.draw_idle()
                 return
             # Preserve zoom/pan across time changes (same config, different ti)
-            state_no_ti = ("pol", getattr(case, "label", None), region, sepadd, use_spol, xpt_mode, vars_to_plot, modes)
+            state_no_ti = ("pol", getattr(case, "label", None), region, sepadd, use_spol, xpt_mode, vars_to_plot, modes, overlays)
             _view_restore = self._maybe_capture_view_2d(kind="pol", state_key_no_ti=state_no_ti)
             self._last_draw_state_2d["pol"] = state_key
         except Exception:
@@ -3951,8 +3983,10 @@ class Hermes3QtMainWindow(QMainWindow):
                 if ylim_mode == "global":
                     ylim_mode = "max"
                 if ylim_mode == "auto":
+                    # Force full autoscale to include all plotted data (including overlays)
                     ax.relim()
-                    ax.autoscale_view()
+                    ax.autoscale(enable=True, axis='y', tight=False)
+                    ax.autoscale_view(scalex=False, scaley=True)
                 else:
                     c0 = self._primary_case()
                     if c0 is not None:
@@ -3999,7 +4033,9 @@ class Hermes3QtMainWindow(QMainWindow):
             region = str(self.rad_region_combo.currentText() or "omp")
             vars_to_plot = tuple(self.selected_vars)
             modes = tuple((v, self._yscale_by_var.get(v, "linear"), self._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
-            state_key = ("rad", getattr(case, "label", None), ti, region, vars_to_plot, modes)
+            # Include overlay variables in state key so view isn't restored when overlays change
+            overlays = tuple((v, tuple(self._overlay_vars.get(v, []))) for v in vars_to_plot)
+            state_key = ("rad", getattr(case, "label", None), ti, region, vars_to_plot, modes, overlays)
             if self._last_draw_state_2d.get("rad") == state_key and self.rad_figure.axes:
                 try:
                     self._position_overlay_buttons_rad()
@@ -4008,7 +4044,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 self.rad_canvas.draw_idle()
                 return
             # Preserve zoom/pan across time changes (same config, different ti)
-            state_no_ti = ("rad", getattr(case, "label", None), region, vars_to_plot, modes)
+            state_no_ti = ("rad", getattr(case, "label", None), region, vars_to_plot, modes, overlays)
             _view_restore = self._maybe_capture_view_2d(kind="rad", state_key_no_ti=state_no_ti)
             self._last_draw_state_2d["rad"] = state_key
         except Exception:
@@ -4223,8 +4259,10 @@ class Hermes3QtMainWindow(QMainWindow):
                 if ylim_mode == "global":
                     ylim_mode = "max"
                 if ylim_mode == "auto":
+                    # Force full autoscale to include all plotted data (including overlays)
                     ax.relim()
-                    ax.autoscale_view()
+                    ax.autoscale(enable=True, axis='y', tight=False)
+                    ax.autoscale_view(scalex=False, scaley=True)
                 else:
                     c0 = self._primary_case()
                     if c0 is not None:
@@ -4597,8 +4635,10 @@ class Hermes3QtMainWindow(QMainWindow):
             guard0 = bool(self._guard_replace_enabled())
             case_labels0 = tuple(self.cases.keys())
             ti0 = int(self._get_time_index())
-            state_key = ("prof", case_labels0, ti0, sdim0, vars0, modes0, guard0)
-            state_no_ti = ("prof", case_labels0, sdim0, vars0, modes0, guard0)
+            # Include overlay variables in state key so view isn't restored when overlays change
+            overlays0 = tuple((v, tuple(self._overlay_vars.get(v, []))) for v in vars0)
+            state_key = ("prof", case_labels0, ti0, sdim0, vars0, modes0, guard0, overlays0)
+            state_no_ti = ("prof", case_labels0, sdim0, vars0, modes0, guard0, overlays0)
             _view_restore_1d = self._maybe_capture_view_1d(state_key_no_ti=state_no_ti)
             self._last_draw_state_1d_profiles = state_key
         except Exception:
@@ -4867,8 +4907,10 @@ class Hermes3QtMainWindow(QMainWindow):
             # Apply y-limit mode
             try:
                 if ylim_mode == "auto":
+                    # Force full autoscale to include all plotted data (including overlays)
                     ax.relim()
-                    ax.autoscale_view()
+                    ax.autoscale(enable=True, axis='y', tight=False)
+                    ax.autoscale_view(scalex=False, scaley=True)
                 elif ylim_mode == "final":
                     ymin, ymax = self._compute_ylim_for_final(name, tdim, mode)
                     if ymin is not None and ymax is not None:
