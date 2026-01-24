@@ -579,7 +579,7 @@ def _ensure_sdtools_on_path():
 
 # ---- Qt imports (PyQt6 preferred; fall back to PySide6) ----
 try:
-    from PyQt6.QtCore import QEvent, Qt, QTimer  # type: ignore
+    from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer  # type: ignore
     from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut  # type: ignore
     from PyQt6.QtWidgets import (  # type: ignore
         QAbstractItemView,
@@ -612,7 +612,7 @@ try:
         return Qt.CheckState.Unchecked
 
 except Exception:  # pragma: no cover
-    from PySide6.QtCore import QEvent, Qt, QTimer  # type: ignore
+    from PySide6.QtCore import QEvent, QPoint, Qt, QTimer  # type: ignore
     from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut  # type: ignore
     from PySide6.QtWidgets import (  # type: ignore
         QAbstractItemView,
@@ -763,6 +763,8 @@ class Hermes3QtMainWindow(QMainWindow):
         self._selected_set: set[str] = set()
         self._yscale_by_var: Dict[str, str] = {}  # var -> {"linear","log","symlog"}
         self._ylim_mode_by_var: Dict[str, str] = {}  # var -> {"auto","final","max"} (legacy: "global" == "max")
+        self._xscale_by_var: Dict[str, str] = {}  # var -> {"linear","log"}
+        self._overlay_vars: Dict[str, List[str]] = {}  # primary_var -> [overlaid_vars]
         self._var_filter: str = ""
 
         self._build_ui()
@@ -786,16 +788,19 @@ class Hermes3QtMainWindow(QMainWindow):
 
         # Keep overlay buttons positioned correctly on draw + resize.
         self.canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons())
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_button_press)
         self.canvas.installEventFilter(self)
         # 2D canvases (created in _build_ui) also use overlay buttons.
         # These may not exist in early init, so guard with getattr.
         try:
             self.pol_canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons_pol())
+            self.pol_canvas.mpl_connect("button_press_event", self._on_pol_canvas_button_press)
             self.pol_canvas.installEventFilter(self)
         except Exception:
             pass
         try:
             self.rad_canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons_rad())
+            self.rad_canvas.mpl_connect("button_press_event", self._on_rad_canvas_button_press)
             self.rad_canvas.installEventFilter(self)
         except Exception:
             pass
@@ -932,6 +937,17 @@ class Hermes3QtMainWindow(QMainWindow):
         self.datasets_label.setWordWrap(True)
         left_layout.addWidget(self.datasets_label)
 
+        # Plot style option: datasets by colour or linestyle
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel("Distinguish datasets by:"))
+        self.dataset_style_combo = QComboBox()
+        self.dataset_style_combo.addItems(["colour", "linestyle"])
+        self.dataset_style_combo.setCurrentIndex(1)  # Default: linestyle
+        self.dataset_style_combo.currentIndexChanged.connect(lambda _: self.request_redraw())
+        style_row.addWidget(self.dataset_style_combo)
+        style_row.addStretch(1)
+        left_layout.addLayout(style_row)
+
         # Shared variable list (used for both Profiles and Time history)
         left_layout.addWidget(QLabel("Search variables"))
         self.search_edit = QLineEdit()
@@ -1012,10 +1028,13 @@ class Hermes3QtMainWindow(QMainWindow):
         prof_ctrl_layout = QVBoxLayout(prof_ctrl_tab)
         prof_ctrl_layout.setContentsMargins(6, 6, 6, 6)
         prof_ctrl_layout.setSpacing(6)
-        prof_ctrl_layout.addWidget(QLabel("Profiles controls:\n- Use the overlay buttons on each plot for y-scale and y-limits.\n- Or right-click a variable to set modes."))
+        prof_ctrl_layout.addWidget(QLabel("Profiles controls:\n- Use the overlay buttons on each plot for y-scale and y-limits.\n- Shift+right-click a subplot for more options."))
         self.guard_replace_check = QCheckBox("Replace guard cells (1D only)")
         self.guard_replace_check.setChecked(True)
         prof_ctrl_layout.addWidget(self.guard_replace_check)
+        self.constrain_overlay_units_check = QCheckBox("Constrain subplot overlays by units")
+        self.constrain_overlay_units_check.setChecked(True)
+        prof_ctrl_layout.addWidget(self.constrain_overlay_units_check)
         prof_ctrl_layout.addStretch(1)
 
         # Time history controls
@@ -1650,8 +1669,37 @@ class Hermes3QtMainWindow(QMainWindow):
             return vars_all
         return [v for v in vars_all if q in v.lower()]
 
+    def _get_var_units(self, varname: str) -> Optional[str]:
+        """Get units string for a variable from the loaded dataset(s) or derived variables."""
+        # First check loaded datasets
+        cases = getattr(self, "cases", None)
+        if cases:
+            for c in cases.values():
+                ds = getattr(c, "ds", None)
+                if ds is None:
+                    continue
+                if varname in ds:
+                    try:
+                        units = ds[varname].attrs.get("units", None)
+                        if units:
+                            return units
+                    except Exception:
+                        pass
+        # Fall back to derived variable registry
+        try:
+            from derived_variables import get_derived_var_units
+            units = get_derived_var_units(varname)
+            if units:
+                return units
+        except Exception:
+            pass
+        return None
+
     def _item_text_for_var(self, name: str) -> str:
-        # Keep variable list clean; controls live on plots / context menu.
+        # Show variable name with units if available
+        units = self._get_var_units(name)
+        if units:
+            return f"{name} [{units}]"
         return str(name)
 
     def _render_var_list(self) -> None:
@@ -1834,6 +1882,214 @@ class Hermes3QtMainWindow(QMainWindow):
         self._refresh_var_item(varname)
         self._refresh_overlay_button_labels(varname)
         self.request_redraw()
+
+    def _set_var_xscale(self, varname: str, mode: str) -> None:
+        """Set x-scale for a variable's subplot."""
+        self._xscale_by_var[varname] = mode
+        self.request_redraw()
+
+    def _datasets_by_colour(self) -> bool:
+        """Return True if datasets should be distinguished by colour (vs linestyle)."""
+        try:
+            return self.dataset_style_combo.currentText() == "colour"
+        except Exception:
+            return True  # Default to colour
+
+    # ---------- Right-click context menu on subplots ----------
+    def _var_from_axes(self, ax, axes_map: Optional[Dict[str, object]] = None) -> Optional[str]:
+        """Given an axes object, find which variable it displays."""
+        if axes_map is None:
+            axes_map = self._overlay_axes_by_var
+        for var, ax_obj in axes_map.items():
+            if ax_obj is ax:
+                return var
+        return None
+
+    def _build_subplot_context_menu(self, varname: str, ax, canvas_type: str = "main") -> "QMenu":
+        """Build context menu for a subplot showing the given variable."""
+        menu = QMenu(self)
+
+        # --- Y-limits submenu ---
+        m_ylim = menu.addMenu("Y-limits")
+        for mode in ("auto", "final", "max"):
+            a = QAction(mode, self)
+            a.setCheckable(True)
+            cur_mode = self._ylim_mode_by_var.get(varname, "auto")
+            if cur_mode == "global":
+                cur_mode = "max"
+            a.setChecked(cur_mode == mode)
+            a.triggered.connect(partial(self._set_var_ylim_mode, varname, mode))
+            m_ylim.addAction(a)
+
+        # --- Y-scale submenu ---
+        m_yscale = menu.addMenu("Y-scale")
+        for mode in ("linear", "log", "symlog"):
+            a = QAction(mode, self)
+            a.setCheckable(True)
+            a.setChecked(self._yscale_by_var.get(varname, "linear") == mode)
+            a.triggered.connect(partial(self._set_var_yscale, varname, mode))
+            m_yscale.addAction(a)
+
+        # --- X-scale submenu ---
+        m_xscale = menu.addMenu("X-scale")
+        for mode in ("linear", "log"):
+            a = QAction(mode, self)
+            a.setCheckable(True)
+            a.setChecked(self._xscale_by_var.get(varname, "linear") == mode)
+            a.triggered.connect(partial(self._set_var_xscale, varname, mode))
+            m_xscale.addAction(a)
+
+        menu.addSeparator()
+
+        # --- Add variable to this subplot (overlay) ---
+        m_add = menu.addMenu("Add variable to subplot")
+        # Make the submenu scrollable for long variable lists
+        m_add.setStyleSheet("QMenu { menu-scrollable: 1; }")
+        # Get all available vars minus already selected/overlaid
+        all_vars = list(self.state.get("vars") or [])
+        current_overlays = self._overlay_vars.get(varname, [])
+        excluded = self._selected_set | set(current_overlays) | {varname}
+        primary_units = self._get_var_units(varname)
+        # Optionally filter to only show variables with matching units
+        constrain_by_units = self.constrain_overlay_units_check.isChecked()
+        if constrain_by_units:
+            available_vars = [
+                v for v in all_vars
+                if v not in excluded and self._get_var_units(v) == primary_units
+            ]
+        else:
+            available_vars = [v for v in all_vars if v not in excluded]
+        if available_vars:
+            for v in available_vars:
+                units = self._get_var_units(v)
+                label = f"{v} [{units}]" if units else v
+                a = QAction(label, self)
+                a.triggered.connect(partial(self._add_var_to_subplot, v, varname))
+                m_add.addAction(a)
+        else:
+            if constrain_by_units and primary_units:
+                info = QAction(f"(no variables with units [{primary_units}])", self)
+            else:
+                info = QAction("(no additional variables available)", self)
+            info.setEnabled(False)
+            m_add.addAction(info)
+
+        # --- Show current overlays with option to remove ---
+        current_overlays = self._overlay_vars.get(varname, [])
+        if current_overlays:
+            m_remove_overlay = menu.addMenu("Remove overlay")
+            for ov in current_overlays:
+                units = self._get_var_units(ov)
+                label = f"{ov} [{units}]" if units else ov
+                a = QAction(label, self)
+                a.triggered.connect(partial(self._remove_overlay_from_subplot, ov, varname))
+                m_remove_overlay.addAction(a)
+
+        menu.addSeparator()
+
+        # --- Remove this subplot ---
+        act_remove = QAction(f"Remove subplot ({varname})", self)
+        act_remove.triggered.connect(partial(self._remove_subplot_var, varname))
+        menu.addAction(act_remove)
+
+        return menu
+
+    def _add_var_to_subplot(self, new_var: str, target_var: str) -> None:
+        """Add a variable to be overlaid on the target variable's subplot."""
+        if target_var not in self._overlay_vars:
+            self._overlay_vars[target_var] = []
+        if new_var not in self._overlay_vars[target_var]:
+            self._overlay_vars[target_var].append(new_var)
+        self.request_redraw()
+
+    def _remove_overlay_from_subplot(self, overlay_var: str, target_var: str) -> None:
+        """Remove an overlaid variable from a subplot."""
+        if target_var in self._overlay_vars:
+            if overlay_var in self._overlay_vars[target_var]:
+                self._overlay_vars[target_var].remove(overlay_var)
+            if not self._overlay_vars[target_var]:
+                del self._overlay_vars[target_var]
+        self.request_redraw()
+
+    def _remove_subplot_var(self, varname: str) -> None:
+        """Uncheck a variable from the selection, removing its subplot."""
+        # Also clean up any overlays associated with this variable
+        if varname in self._overlay_vars:
+            del self._overlay_vars[varname]
+        # Uncheck from vars_list
+        item = self._find_item_by_var(varname)
+        if item is not None:
+            item.setCheckState(_qt_unchecked())
+            # _on_var_item_changed will handle _selected_set and redraw
+
+    def _is_shift_held(self) -> bool:
+        """Check if Shift key is currently held using Qt."""
+        try:
+            from PyQt6.QtWidgets import QApplication
+            mods = QApplication.keyboardModifiers()
+            return bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        except Exception:
+            pass
+        try:
+            from PySide6.QtWidgets import QApplication
+            mods = QApplication.keyboardModifiers()
+            return bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        except Exception:
+            pass
+        return False
+
+    def _on_canvas_button_press(self, event) -> None:
+        """Handle Shift+right-click on the main 1D profiles canvas for context menu."""
+        if event.button != 3:  # Right-click only
+            return
+        # Require Shift modifier to avoid interfering with matplotlib zoom
+        if not self._is_shift_held():
+            return
+        if event.inaxes is None:
+            return
+        varname = self._var_from_axes(event.inaxes, self._overlay_axes_by_var)
+        if varname is None:
+            return
+        menu = self._build_subplot_context_menu(varname, event.inaxes, canvas_type="main")
+        # Convert matplotlib coords to Qt global coords
+        global_pos = self.canvas.mapToGlobal(
+            QPoint(int(event.x), int(self.canvas.height() - event.y))
+        )
+        menu.exec(global_pos)
+
+    def _on_pol_canvas_button_press(self, event) -> None:
+        """Handle Shift+right-click on the 2D poloidal canvas for context menu."""
+        if event.button != 3:
+            return
+        if not self._is_shift_held():
+            return
+        if event.inaxes is None:
+            return
+        varname = self._var_from_axes(event.inaxes, self._overlay_axes_by_var_pol)
+        if varname is None:
+            return
+        menu = self._build_subplot_context_menu(varname, event.inaxes, canvas_type="pol")
+        global_pos = self.pol_canvas.mapToGlobal(
+            QPoint(int(event.x), int(self.pol_canvas.height() - event.y))
+        )
+        menu.exec(global_pos)
+
+    def _on_rad_canvas_button_press(self, event) -> None:
+        """Handle Shift+right-click on the 2D radial canvas for context menu."""
+        if event.button != 3:
+            return
+        if not self._is_shift_held():
+            return
+        if event.inaxes is None:
+            return
+        varname = self._var_from_axes(event.inaxes, self._overlay_axes_by_var_rad)
+        if varname is None:
+            return
+        menu = self._build_subplot_context_menu(varname, event.inaxes, canvas_type="rad")
+        global_pos = self.rad_canvas.mapToGlobal(
+            QPoint(int(event.x), int(self.rad_canvas.height() - event.y))
+        )
+        menu.exec(global_pos)
 
     # ---------- Overlay buttons on plots (Option B) ----------
     def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
@@ -2312,6 +2568,23 @@ class Hermes3QtMainWindow(QMainWindow):
                     is_2d = True
                 else:
                     raise
+        
+        # Compute derived variables (optional)
+        try:
+            import derived_variables as dv
+            print(f"Computing derived variables for {label}...")
+            available = dv.get_available_variables()
+            if available:
+                print(f"  Found {len(available)} registered derived variable(s)")
+                cs.ds = dv.compute_derived_variables(cs.ds)
+            else:
+                print("  No derived variables registered")
+        except ImportError:
+            print("derived_variables.py not found - skipping derived quantities")
+        except Exception as e:
+            print(f"Warning: Error computing derived variables: {e}")
+            # Continue loading even if derived variables fail
+        
         tdim = _infer_time_dim(cs.ds)
         n_time = int(cs.ds.sizes[tdim]) if tdim and tdim in cs.ds.dims else 1
         return _LoadedCase(label=label, case_path=case_path, ds=cs.ds, n_time=n_time, is_2d=is_2d)
@@ -3518,7 +3791,7 @@ class Hermes3QtMainWindow(QMainWindow):
             xline_rmin = None
 
         # Batch extract once per case/time/region/sepadd for speed
-        # Configure y-scales per variable before plotting
+        # Configure y-scales and x-scales per variable before plotting
         for ax, name in zip(axes, vars_to_plot):
             mode = self._yscale_by_var.get(name, "linear")
             try:
@@ -3530,14 +3803,32 @@ class Hermes3QtMainWindow(QMainWindow):
                     ax.set_yscale("linear")
             except Exception:
                 pass
+            # X-scale
+            xscale_mode = self._xscale_by_var.get(name, "linear")
+            try:
+                if xscale_mode == "log":
+                    ax.set_xscale("log")
+                else:
+                    ax.set_xscale("linear")
+            except Exception:
+                pass
 
-        for c in self.cases.values():
+        # Collect all overlay variables to include in extraction
+        all_overlay_vars: List[str] = []
+        for name in vars_to_plot:
+            all_overlay_vars.extend(self._overlay_vars.get(name, []))
+
+        linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+        datasets_by_colour = self._datasets_by_colour()
+
+        for case_idx, c in enumerate(self.cases.values()):
             ds_t = self._ds_at_time(c)
             ti = self._get_time_index_for_case(c)
             # Incremental cache: keep one df per (case,time,region,sepadd) and extend
             ck = (c.label, ti, region, sepadd)
             df = self._pol_cache.get(ck)
-            params = _selector_params_only(list(vars_to_plot))
+            # Include overlay vars in params for extraction
+            params = _selector_params_only(list(vars_to_plot) + list(all_overlay_vars))
             if df is None:
                 try:
                     df = get_1d_poloidal_data(ds_t, params=list(params), region=region, sepadd=sepadd, target_first=False)
@@ -3570,8 +3861,14 @@ class Hermes3QtMainWindow(QMainWindow):
                 x = np.asarray(df.get(xcol, df.get("Spar")).values)  # type: ignore[union-attr]
             except Exception:
                 x = np.asarray(df["Spar"].values)
+
             for ax, name in zip(axes, vars_to_plot):
-                ax.set_title(f"{name} ({region}, sepadd={sepadd})", fontsize=10)
+                overlay_vars = self._overlay_vars.get(name, [])
+                if overlay_vars:
+                    title = f"{name} + {', '.join(overlay_vars)} ({region}, sepadd={sepadd})"
+                else:
+                    title = f"{name} ({region}, sepadd={sepadd})"
+                ax.set_title(title, fontsize=10)
                 ax.grid(True, alpha=0.3)
                 try:
                     y = np.asarray(df[name].values)
@@ -3580,7 +3877,39 @@ class Hermes3QtMainWindow(QMainWindow):
                 # If log scale, mask non-positive values
                 if self._yscale_by_var.get(name, "linear") == "log":
                     y = np.where(y > 0, y, np.nan)
-                ax.plot(x, y, label=c.label)
+                # Label with variable name if overlays exist
+                if overlay_vars:
+                    plot_label = f"{name} ({c.label})" if len(self.cases) > 1 else name
+                else:
+                    plot_label = c.label
+
+                if datasets_by_colour:
+                    # Datasets by colour: primary var solid, let matplotlib pick color
+                    line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0])
+                    case_color = line.get_color()
+                    case_ls = linestyles[0]
+                else:
+                    # Datasets by linestyle: each dataset gets different linestyle
+                    case_ls = linestyles[case_idx % len(linestyles)]
+                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls)
+                    case_color = line.get_color()
+
+                # Plot overlay variables
+                for ov_idx, ov_name in enumerate(overlay_vars):
+                    try:
+                        ov_y = np.asarray(df[ov_name].values)
+                        if self._yscale_by_var.get(name, "linear") == "log":
+                            ov_y = np.where(ov_y > 0, ov_y, np.nan)
+                        ov_label = f"{ov_name} ({c.label})" if len(self.cases) > 1 else ov_name
+                        if datasets_by_colour:
+                            # Overlays use different linestyle, same color per case
+                            ls = linestyles[(ov_idx + 1) % len(linestyles)]
+                            ax.plot(x, ov_y, label=ov_label, linestyle=ls, color=case_color)
+                        else:
+                            # Overlays use different color, same linestyle per case
+                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls)
+                    except Exception:
+                        pass
 
         for ax, name in zip(axes, vars_to_plot):
             # Units (match 1D GUI behavior)
@@ -3594,7 +3923,9 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     continue
             ax.set_ylabel(f"{units}" if units else "")
-            if len(self.cases) > 1:
+            # Show legend if multiple cases or overlays
+            overlay_vars = self._overlay_vars.get(name, [])
+            if len(self.cases) > 1 or overlay_vars:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(xlab)
             if xline_rmin is not None and np.isfinite(xline_rmin):
@@ -3737,7 +4068,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 return
 
         # Batch extract once per case/time/region for speed
-        # Configure y-scales per variable before plotting
+        # Configure y-scales and x-scales per variable before plotting
         for ax, name in zip(axes, vars_to_plot):
             mode = self._yscale_by_var.get(name, "linear")
             try:
@@ -3749,14 +4080,32 @@ class Hermes3QtMainWindow(QMainWindow):
                     ax.set_yscale("linear")
             except Exception:
                 pass
+            # X-scale
+            xscale_mode = self._xscale_by_var.get(name, "linear")
+            try:
+                if xscale_mode == "log":
+                    ax.set_xscale("log")
+                else:
+                    ax.set_xscale("linear")
+            except Exception:
+                pass
 
-        for c in self.cases.values():
+        # Collect all overlay variables to include in extraction
+        all_overlay_vars: List[str] = []
+        for name in vars_to_plot:
+            all_overlay_vars.extend(self._overlay_vars.get(name, []))
+
+        linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+        datasets_by_colour = self._datasets_by_colour()
+
+        for case_idx, c in enumerate(self.cases.values()):
             ds_t = self._ds_at_time(c)
             ti = self._get_time_index_for_case(c)
             # Incremental cache: keep one df per (case,time,region) and extend
             ck = (c.label, ti, region)
             df = self._rad_cache.get(ck)
-            params = _selector_params_only(list(vars_to_plot))
+            # Include overlay vars in params for extraction
+            params = _selector_params_only(list(vars_to_plot) + list(all_overlay_vars))
             if df is None:
                 try:
                     df = get_1d_radial_data(ds_t, params=list(params), region=region, guards=False, sol=True, core=True)
@@ -3786,8 +4135,14 @@ class Hermes3QtMainWindow(QMainWindow):
 
             # Plot radial coordinate in mm
             x = np.asarray(df["Srad"].values) * 1e3
+
             for ax, name in zip(axes, vars_to_plot):
-                ax.set_title(f"{name} ({region})", fontsize=10)
+                overlay_vars = self._overlay_vars.get(name, [])
+                if overlay_vars:
+                    title = f"{name} + {', '.join(overlay_vars)} ({region})"
+                else:
+                    title = f"{name} ({region})"
+                ax.set_title(title, fontsize=10)
                 ax.grid(True, alpha=0.3)
                 try:
                     y = np.asarray(df[name].values)
@@ -3795,7 +4150,39 @@ class Hermes3QtMainWindow(QMainWindow):
                     continue
                 if self._yscale_by_var.get(name, "linear") == "log":
                     y = np.where(y > 0, y, np.nan)
-                ax.plot(x, y, label=c.label)
+                # Label with variable name if overlays exist
+                if overlay_vars:
+                    plot_label = f"{name} ({c.label})" if len(self.cases) > 1 else name
+                else:
+                    plot_label = c.label
+
+                if datasets_by_colour:
+                    # Datasets by colour: primary var solid, let matplotlib pick color
+                    line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0])
+                    case_color = line.get_color()
+                    case_ls = linestyles[0]
+                else:
+                    # Datasets by linestyle: each dataset gets different linestyle
+                    case_ls = linestyles[case_idx % len(linestyles)]
+                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls)
+                    case_color = line.get_color()
+
+                # Plot overlay variables
+                for ov_idx, ov_name in enumerate(overlay_vars):
+                    try:
+                        ov_y = np.asarray(df[ov_name].values)
+                        if self._yscale_by_var.get(name, "linear") == "log":
+                            ov_y = np.where(ov_y > 0, ov_y, np.nan)
+                        ov_label = f"{ov_name} ({c.label})" if len(self.cases) > 1 else ov_name
+                        if datasets_by_colour:
+                            # Overlays use different linestyle, same color per case
+                            ls = linestyles[(ov_idx + 1) % len(linestyles)]
+                            ax.plot(x, ov_y, label=ov_label, linestyle=ls, color=case_color)
+                        else:
+                            # Overlays use different color, same linestyle per case
+                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls)
+                    except Exception:
+                        pass
 
         for ax, name in zip(axes, vars_to_plot):
             # Units (match 1D GUI behavior)
@@ -3809,7 +4196,9 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     continue
             ax.set_ylabel(f"{units}" if units else "")
-            if len(self.cases) > 1:
+            # Show legend if multiple cases or overlays
+            overlay_vars = self._overlay_vars.get(name, [])
+            if len(self.cases) > 1 or overlay_vars:
                 ax.legend(loc="best", fontsize=8)
             ax.set_xlabel(r"$r^\prime - r_{sep}$ (mm)")
             # Separatrix marker
@@ -4327,6 +4716,16 @@ class Hermes3QtMainWindow(QMainWindow):
             except Exception as e:
                 self.set_status(f"Y-scale error for {name}: {e}", is_error=True)
 
+            # Configure x-scale
+            xscale_mode = self._xscale_by_var.get(name, "linear")
+            try:
+                if xscale_mode == "log":
+                    ax.set_xscale("log")
+                else:
+                    ax.set_xscale("linear")
+            except Exception as e:
+                self.set_status(f"X-scale error for {name}: {e}", is_error=True)
+
             # Extract units from first dataset that has var
             units = None
             for c in self.cases.values():
@@ -4339,7 +4738,13 @@ class Hermes3QtMainWindow(QMainWindow):
                     except Exception:
                         pass
 
-            for c in self.cases.values():
+            # Track colors/styles per case for consistent differentiation
+            case_colors: Dict[str, str] = {}
+            overlay_vars = self._overlay_vars.get(name, [])
+            linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+            datasets_by_colour = self._datasets_by_colour()
+
+            for case_idx, c in enumerate(self.cases.values()):
                 ds = c.ds
                 if name not in ds:
                     continue
@@ -4366,9 +4771,64 @@ class Hermes3QtMainWindow(QMainWindow):
                         pass
                     if mode == "log":
                         y = np.where(y > 0, y, np.nan)
-                    ax.plot(x, y, label=c.label)
+                    # Use variable name as label if overlays exist, else case label
+                    if overlay_vars:
+                        plot_label = f"{name} ({c.label})" if len(self.cases) > 1 else name
+                    else:
+                        plot_label = c.label
+
+                    if datasets_by_colour:
+                        # Datasets by colour: primary var solid, let matplotlib pick color
+                        line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0])
+                        case_colors[c.label] = line.get_color()
+                    else:
+                        # Datasets by linestyle: each dataset gets different linestyle, same color
+                        ls = linestyles[case_idx % len(linestyles)]
+                        line, = ax.plot(x, y, label=plot_label, linestyle=ls)
+                        case_colors[c.label] = (line.get_color(), ls)
                 except Exception as e:
                     self.set_status(f"Plot error for {name}: {e}", is_error=True)
+
+            # Plot overlay variables on the same axes
+            for ov_idx, ov_name in enumerate(overlay_vars):
+                for case_idx, c in enumerate(self.cases.values()):
+                    ds = c.ds
+                    if ov_name not in ds:
+                        continue
+                    try:
+                        da = ds[ov_name]
+                        case_ti = self._get_time_index_for_case(c)
+                        if tdim is not None and tdim in da.dims:
+                            da1 = da.isel({tdim: case_ti})
+                        else:
+                            da1 = da
+                        if sdim and sdim in ds.coords:
+                            x = np.asarray(ds[sdim].values)
+                        else:
+                            x = np.arange(int(ds.sizes.get(sdim, da1.size))) if sdim else np.arange(da1.size)
+                        y = np.asarray(da1.values)
+                        if self._guard_replace_enabled() and y.ndim == 1 and sdim in getattr(da1, "dims", ()):
+                            x, y = _guard_replace_1d_profile_xy(x, y)
+                        try:
+                            x, y = _downsample_xy(x, y, int(self._profile_max_points))
+                        except Exception:
+                            pass
+                        if mode == "log":
+                            y = np.where(y > 0, y, np.nan)
+                        ov_label = f"{ov_name} ({c.label})" if len(self.cases) > 1 else ov_name
+
+                        if datasets_by_colour:
+                            # Datasets by colour: overlays use different linestyle, same color per case
+                            ls = linestyles[(ov_idx + 1) % len(linestyles)]
+                            color = case_colors.get(c.label)
+                            ax.plot(x, y, label=ov_label, linestyle=ls, color=color)
+                        else:
+                            # Datasets by linestyle: overlays use different color, same linestyle per case
+                            stored = case_colors.get(c.label)
+                            ls = stored[1] if stored else linestyles[case_idx % len(linestyles)]
+                            ax.plot(x, y, label=ov_label, linestyle=ls)  # let matplotlib pick new color
+                    except Exception as e:
+                        self.set_status(f"Overlay plot error for {ov_name}: {e}", is_error=True)
 
             # X-point marker from options (1D only)
             try:
@@ -4391,11 +4851,18 @@ class Hermes3QtMainWindow(QMainWindow):
             except Exception:
                 pass
 
-            ax.set_title(name, fontsize=10)
+            # Update title to show overlaid variables
+            overlay_vars = self._overlay_vars.get(name, [])
+            if overlay_vars:
+                title = f"{name} + {', '.join(overlay_vars)}"
+            else:
+                title = name
+            ax.set_title(title, fontsize=10)
             ax.set_ylabel(f"{units}" if units else "")
             ax.grid(True, which="both", alpha=0.3)
-            if len(self.cases) > 1:
-                ax.legend(loc="upper left", fontsize=9)
+            # Show legend if multiple cases or overlays
+            if len(self.cases) > 1 or overlay_vars:
+                ax.legend(loc="upper left", fontsize=8)
 
             # Apply y-limit mode
             try:
