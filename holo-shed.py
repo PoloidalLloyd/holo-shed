@@ -104,6 +104,35 @@ def _is_plottable_2d_var(da, time_dim: Optional[str]) -> bool:
     return False
 
 
+def _is_radial_only_2d_var(da, time_dim: Optional[str]) -> bool:
+    """
+    Check for derived variables that only have radial ('x') dimension.
+
+    These are reduced quantities like detachment_location that have been
+    computed along the poloidal direction, leaving only radial variation.
+    They can be plotted in the radial profiles view.
+    """
+    dims = tuple(getattr(da, "dims", ()))
+    if "x" not in dims:
+        return False
+    # Don't include full 2D vars (those go through _is_plottable_2d_var)
+    if "theta" in dims or "y" in dims:
+        return False
+    # Accept (x,) only
+    if len(dims) == 1 and dims[0] == "x":
+        return True
+    # Accept (x, time_dim) with any common time dimension name
+    if len(dims) == 2:
+        other_dim = [d for d in dims if d != "x"][0]
+        # Check if the other dimension is a time dimension
+        if time_dim and other_dim == time_dim:
+            return True
+        # Also accept common time dimension names
+        if other_dim in ("t", "time"):
+            return True
+    return False
+
+
 def _list_plottable_vars_2d(ds, time_dim: Optional[str]) -> List[str]:
     out: List[str] = []
     # Include derived/geometry coordinates (e.g. R, Z) as plottable options too.
@@ -115,7 +144,8 @@ def _list_plottable_vars_2d(ds, time_dim: Optional[str]) -> List[str]:
             continue
         try:
             da = ds[name]
-            if _is_plottable_2d_var(da, time_dim=time_dim):
+            # Include both full 2D vars and radial-only derived vars
+            if _is_plottable_2d_var(da, time_dim=time_dim) or _is_radial_only_2d_var(da, time_dim=time_dim):
                 out.append(name)
         except Exception:
             continue
@@ -819,6 +849,8 @@ class Hermes3QtMainWindow(QMainWindow):
         # Cached y-limits for 2D extracted 1D plots (poloidal/radial)
         self._pol_ylim_cache: Dict[tuple, Tuple[Optional[float], Optional[float]]] = {}
         self._rad_ylim_cache: Dict[tuple, Tuple[Optional[float], Optional[float]]] = {}
+        # Cached y-limits for 1D profile plots
+        self._1d_ylim_cache: Dict[tuple, Tuple[Optional[float], Optional[float]]] = {}
         self._profile_max_points = 2500
         self._fast_slider_step = 10  # Shift+Arrow moves by this many indices
         # 2D polygon colorbar limits are only applied when user confirms
@@ -2775,6 +2807,7 @@ class Hermes3QtMainWindow(QMainWindow):
             try:
                 self._pol_ylim_cache.clear()
                 self._rad_ylim_cache.clear()
+                self._1d_ylim_cache.clear()
             except Exception:
                 pass
             self.request_time_history_redraw()
@@ -2855,7 +2888,15 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _compute_ylim_for_final(self, varname: str, tdim: Optional[str], yscale: str) -> Tuple[Optional[float], Optional[float]]:
         # Include overlay variables in the y-limit calculation
-        all_vars = [varname] + list(self._overlay_vars.get(varname, []))
+        overlay_vars = tuple(self._overlay_vars.get(varname, []))
+        all_vars = [varname] + list(overlay_vars)
+        # Cache key includes: mode, varname, overlays, yscale, and case n_times
+        case_info = tuple((c.label, c.n_time) for c in self.cases.values())
+        cache_key = ("final", varname, overlay_vars, yscale, case_info)
+        hit = self._1d_ylim_cache.get(cache_key)
+        if hit is not None:
+            return hit
+
         ys_all = []
         for c in self.cases.values():
             ds = c.ds
@@ -2878,17 +2919,29 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     continue
         if not ys_all:
+            self._1d_ylim_cache[cache_key] = (None, None)
             return None, None
         ys = np.concatenate(ys_all)
         if ys.size == 0:
+            self._1d_ylim_cache[cache_key] = (None, None)
             return None, None
         ymin, ymax = float(np.nanmin(ys)), float(np.nanmax(ys))
         margin = 0.05 * (ymax - ymin) if ymax > ymin else 0.1 * abs(ymax)
-        return ymin - margin, ymax + margin
+        result = (ymin - margin, ymax + margin)
+        self._1d_ylim_cache[cache_key] = result
+        return result
 
     def _compute_ylim_for_global(self, varname: str, yscale: str) -> Tuple[Optional[float], Optional[float]]:
         # Include overlay variables in the y-limit calculation
-        all_vars = [varname] + list(self._overlay_vars.get(varname, []))
+        overlay_vars = tuple(self._overlay_vars.get(varname, []))
+        all_vars = [varname] + list(overlay_vars)
+        # Cache key includes: mode, varname, overlays, yscale, and case n_times
+        case_info = tuple((c.label, c.n_time) for c in self.cases.values())
+        cache_key = ("global", varname, overlay_vars, yscale, case_info)
+        hit = self._1d_ylim_cache.get(cache_key)
+        if hit is not None:
+            return hit
+
         ys_all = []
         for c in self.cases.values():
             ds = c.ds
@@ -2906,13 +2959,17 @@ class Hermes3QtMainWindow(QMainWindow):
                 except Exception:
                     continue
         if not ys_all:
+            self._1d_ylim_cache[cache_key] = (None, None)
             return None, None
         ys = np.concatenate(ys_all)
         if ys.size == 0:
+            self._1d_ylim_cache[cache_key] = (None, None)
             return None, None
         ymin, ymax = float(np.nanmin(ys)), float(np.nanmax(ys))
         margin = 0.05 * (ymax - ymin) if ymax > ymin else 0.1 * abs(ymax)
-        return ymin - margin, ymax + margin
+        result = (ymin - margin, ymax + margin)
+        self._1d_ylim_cache[cache_key] = result
+        return result
 
     # ---------- 2D plotting ----------
     def _primary_case(self) -> Optional[_LoadedCase]:
@@ -3318,8 +3375,9 @@ class Hermes3QtMainWindow(QMainWindow):
         if not last:
             return None
         try:
-            # ("prof", case_labels, ti, sdim, vars_to_plot, modes, guard_replace)
-            last_no_ti = ("prof", last[1], last[3], last[4], last[5], last[6])
+            # State key is ("prof", case_labels, ti, sdim, vars, modes, guard, overlays, ...)
+            # Strip ti (index 2) to compare config without time index
+            last_no_ti = ("prof", last[1], *last[3:])
         except Exception:
             return None
         if last_no_ti != state_key_no_ti:
@@ -4169,6 +4227,31 @@ class Hermes3QtMainWindow(QMainWindow):
             if df is None:
                 continue
 
+            # Add radial-only derived variables directly from dataset
+            # These have dims (x,) or (x, time) and aren't extracted by the selector
+            all_needed_vars = list(vars_to_plot) + list(all_overlay_vars)
+            for vname in all_needed_vars:
+                if vname in df.columns:
+                    continue  # Already extracted
+                if vname not in ds_t:
+                    continue  # Not in dataset
+                try:
+                    da = ds_t[vname]
+                    dims = tuple(da.dims)
+                    # Check if it's a radial-only variable (has 'x' dim but not 'theta')
+                    if 'x' in dims and 'theta' not in dims and 'y' not in dims:
+                        # Extract values - should align with df's x indices
+                        if len(dims) == 1 and dims[0] == 'x':
+                            vals = np.asarray(da.values)
+                        else:
+                            # Has other dims (shouldn't happen for radial-only)
+                            continue
+                        # Check length matches
+                        if len(vals) == len(df):
+                            df[vname] = vals
+                except Exception:
+                    pass
+
             # Plot radial coordinate in mm
             x = np.asarray(df["Srad"].values) * 1e3
 
@@ -4180,9 +4263,26 @@ class Hermes3QtMainWindow(QMainWindow):
                     title = f"{name} ({region})"
                 ax.set_title(title, fontsize=10)
                 ax.grid(True, alpha=0.3)
+
+                # Try to get y values from dataframe, or directly from dataset for radial-only vars
+                y = None
                 try:
                     y = np.asarray(df[name].values)
                 except Exception:
+                    pass
+                if y is None and name in ds_t:
+                    # Try to extract radial-only derived variable directly
+                    try:
+                        da = ds_t[name]
+                        dims = tuple(da.dims)
+                        if 'x' in dims and 'theta' not in dims:
+                            y = np.asarray(da.values)
+                            # Check length matches x-axis
+                            if len(y) != len(x):
+                                y = None
+                    except Exception:
+                        pass
+                if y is None:
                     continue
                 if self._yscale_by_var.get(name, "linear") == "log":
                     y = np.where(y > 0, y, np.nan)
@@ -4205,8 +4305,26 @@ class Hermes3QtMainWindow(QMainWindow):
 
                 # Plot overlay variables
                 for ov_idx, ov_name in enumerate(overlay_vars):
+                    ov_y = None
                     try:
                         ov_y = np.asarray(df[ov_name].values)
+                    except Exception:
+                        pass
+                    if ov_y is None and ov_name in ds_t:
+                        # Try to extract radial-only derived variable directly
+                        try:
+                            da = ds_t[ov_name]
+                            dims = tuple(da.dims)
+                            if 'x' in dims and 'theta' not in dims:
+                                ov_y = np.asarray(da.values)
+                                # Check length matches x-axis
+                                if len(ov_y) != len(x):
+                                    ov_y = None
+                        except Exception:
+                            pass
+                    if ov_y is None:
+                        continue
+                    try:
                         if self._yscale_by_var.get(name, "linear") == "log":
                             ov_y = np.where(ov_y > 0, ov_y, np.nan)
                         ov_label = f"{ov_name} ({c.label})" if len(self.cases) > 1 else ov_name
