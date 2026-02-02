@@ -95,6 +95,43 @@ def compute_eq_par_tot(ds):
     return eq_par_tot
 
 
+@register_derived_variable('d+_particle_flux', description='d+ particle flux', units='m^-2 s^-1')
+def compute_dplus_particle_flux(ds):
+    """d+_particle_flux = Vd+ * Nd+"""
+    required = ['Vd+', 'Nd+']
+    if not all(v in ds for v in required):
+        return None
+    dplus_particle_flux = ds['Vd+'] * ds['Nd+']
+    return dplus_particle_flux
+
+@register_derived_variable('e_particle_flux', description='e particle flux', units='m^-2 s^-1')
+def compute_e_particle_flux(ds):
+    """e_particle_flux = Ve * Ne"""
+    required = ['Ve', 'Ne']
+    if not all(v in ds for v in required):
+        return None
+    e_particle_flux = ds['Ve'] * ds['Ne']
+    return e_particle_flux
+
+@register_derived_variable('d_particle_flux', description='d particle flux', units='m^-2 s^-1')
+def compute_d_particle_flux(ds):
+    """d_particle_flux = Vd * Nd"""
+    required = ['Vd', 'Nd']
+    if not all(v in ds for v in required):
+        return None
+    d_particle_flux = ds['Vd'] * ds['Nd']
+    return d_particle_flux
+
+@register_derived_variable('i_particle_flux', description='i particle flux', units='m^-2 s^-1')
+def compute_i_particle_flux(ds):
+    """i_particle_flux = Vi * Ni"""
+    required = ['Vi', 'Ni']
+    if not all(v in ds for v in required):
+        return None
+    i_particle_flux = ds['Vi'] * ds['Ni']
+    return i_particle_flux
+
+    
 def _find_crossing(dist, data, threshold):
     """
     Find the interpolated location where data crosses threshold.
@@ -163,8 +200,8 @@ def compute_front_pardist_5eV(ds):
 
     if is_2d:
         # 2D case: find detachment along each flux tube (for each x)
+        # Spar is only available after calling fline method, so skip silently if not present
         if 'Spar' not in ds:
-            print("    Warning: Spar not found for 2D front tracking")
             return None
 
         pol_dim = 'theta' if 'theta' in Te_dims else 'y'

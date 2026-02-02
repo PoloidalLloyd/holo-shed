@@ -796,6 +796,10 @@ class Hermes3QtMainWindow(QMainWindow):
         self._xscale_by_var: Dict[str, str] = {}  # var -> {"linear","log"}
         self._overlay_vars: Dict[str, List[str]] = {}  # primary_var -> [overlaid_vars]
         self._var_filter: str = ""
+        # Time history specific state
+        self._hist_yscale_by_var: Dict[str, str] = {}  # var -> {"linear","log","symlog"} for time history
+        self._hist_overlay_vars: Dict[str, List[str]] = {}  # primary_var -> [overlaid_vars] for time history
+        self._hist_axes_by_var: Dict[str, tuple] = {}  # var -> (ax_upstream, ax_target)
 
         self._build_ui()
 
@@ -832,6 +836,11 @@ class Hermes3QtMainWindow(QMainWindow):
             self.rad_canvas.mpl_connect("draw_event", lambda _evt: self._position_overlay_buttons_rad())
             self.rad_canvas.mpl_connect("button_press_event", self._on_rad_canvas_button_press)
             self.rad_canvas.installEventFilter(self)
+        except Exception:
+            pass
+        # Time history canvas context menu
+        try:
+            self.hist_canvas.mpl_connect("button_press_event", self._on_hist_canvas_button_press)
         except Exception:
             pass
 
@@ -1703,7 +1712,15 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _get_var_units(self, varname: str) -> Optional[str]:
         """Get units string for a variable from the loaded dataset(s) or derived variables."""
-        # First check loaded datasets
+        # First check derived variable registry (these have explicitly defined units)
+        try:
+            from derived_variables import get_derived_var_units
+            units = get_derived_var_units(varname)
+            if units:
+                return units
+        except Exception:
+            pass
+        # Fall back to dataset attrs
         cases = getattr(self, "cases", None)
         if cases:
             for c in cases.values():
@@ -1717,14 +1734,6 @@ class Hermes3QtMainWindow(QMainWindow):
                             return units
                     except Exception:
                         pass
-        # Fall back to derived variable registry
-        try:
-            from derived_variables import get_derived_var_units
-            units = get_derived_var_units(varname)
-            if units:
-                return units
-        except Exception:
-            pass
         return None
 
     def _item_text_for_var(self, name: str) -> str:
@@ -2056,11 +2065,28 @@ class Hermes3QtMainWindow(QMainWindow):
         # Also clean up any overlays associated with this variable
         if varname in self._overlay_vars:
             del self._overlay_vars[varname]
-        # Uncheck from vars_list
+        # Also clean up time history overlays
+        if varname in self._hist_overlay_vars:
+            del self._hist_overlay_vars[varname]
+
+        # Directly update selection state (don't rely solely on signal)
+        if varname in self._selected_set:
+            self._selected_set.remove(varname)
+            self.selected_vars = [v for v in self.selected_vars if v != varname]
+
+        # Uncheck from vars_list (this may also trigger _on_var_item_changed)
         item = self._find_item_by_var(varname)
         if item is not None:
-            item.setCheckState(_qt_unchecked())
-            # _on_var_item_changed will handle _selected_set and redraw
+            # Block signals to avoid double-processing
+            self.vars_list.blockSignals(True)
+            try:
+                item.setCheckState(_qt_unchecked())
+            finally:
+                self.vars_list.blockSignals(False)
+
+        # Trigger redraw
+        self.request_redraw()
+        self.request_time_history_redraw()
 
     def _is_shift_held(self) -> bool:
         """Check if Shift key is currently held using Qt."""
@@ -2130,6 +2156,129 @@ class Hermes3QtMainWindow(QMainWindow):
             QPoint(int(event.x), int(self.rad_canvas.height() - event.y))
         )
         menu.exec(global_pos)
+
+    # ---------- Time History context menu ----------
+    def _on_hist_canvas_button_press(self, event) -> None:
+        """Handle Shift+right-click on the time history canvas for context menu."""
+        if event.button != 3:  # Right-click only
+            return
+        # Require Shift modifier to avoid interfering with matplotlib zoom
+        if not self._is_shift_held():
+            return
+        if event.inaxes is None:
+            return
+        varname = self._var_from_hist_axes(event.inaxes)
+        if varname is None:
+            return
+        menu = self._build_hist_subplot_context_menu(varname, event.inaxes)
+        # Convert matplotlib coords to Qt global coords
+        global_pos = self.hist_canvas.mapToGlobal(
+            QPoint(int(event.x), int(self.hist_canvas.height() - event.y))
+        )
+        menu.exec(global_pos)
+
+    def _var_from_hist_axes(self, ax) -> Optional[str]:
+        """Find which variable a time history axes belongs to."""
+        for var, (ax_u, ax_t) in self._hist_axes_by_var.items():
+            if ax is ax_u or ax is ax_t:
+                return var
+        return None
+
+    def _build_hist_subplot_context_menu(self, varname: str, ax) -> "QMenu":
+        """Build context menu for a time history subplot."""
+        menu = QMenu(self)
+
+        # --- Y-scale submenu ---
+        m_yscale = menu.addMenu("Y-scale")
+        for mode in ("linear", "log", "symlog"):
+            a = QAction(mode, self)
+            a.setCheckable(True)
+            a.setChecked(self._hist_yscale_by_var.get(varname, "auto") == mode)
+            a.triggered.connect(partial(self._set_hist_var_yscale, varname, mode))
+            m_yscale.addAction(a)
+        # Add "auto" option that uses the original threshold-based logic
+        a_auto = QAction("auto (threshold)", self)
+        a_auto.setCheckable(True)
+        a_auto.setChecked(self._hist_yscale_by_var.get(varname, "auto") == "auto")
+        a_auto.triggered.connect(partial(self._set_hist_var_yscale, varname, "auto"))
+        m_yscale.addAction(a_auto)
+
+        menu.addSeparator()
+
+        # --- Add variable to this subplot (overlay) ---
+        m_add = menu.addMenu("Add variable to subplot")
+        # Make the submenu scrollable for long variable lists
+        m_add.setStyleSheet("QMenu { menu-scrollable: 1; }")
+        # Get all available vars minus already selected/overlaid
+        all_vars = list(self.state.get("vars") or [])
+        current_overlays = self._hist_overlay_vars.get(varname, [])
+        excluded = self._selected_set | set(current_overlays) | {varname}
+        primary_units = self._get_var_units(varname)
+        # Optionally filter to only show variables with matching units
+        constrain_by_units = self.constrain_overlay_units_check.isChecked()
+        if constrain_by_units:
+            available_vars = [
+                v for v in all_vars
+                if v not in excluded and self._get_var_units(v) == primary_units
+            ]
+        else:
+            available_vars = [v for v in all_vars if v not in excluded]
+        if available_vars:
+            for v in available_vars:
+                units = self._get_var_units(v)
+                label = f"{v} [{units}]" if units else v
+                a = QAction(label, self)
+                a.triggered.connect(partial(self._add_var_to_hist_subplot, v, varname))
+                m_add.addAction(a)
+        else:
+            if constrain_by_units and primary_units:
+                info = QAction(f"(no variables with units [{primary_units}])", self)
+            else:
+                info = QAction("(no additional variables available)", self)
+            info.setEnabled(False)
+            m_add.addAction(info)
+
+        # --- Show current overlays with option to remove ---
+        current_overlays = self._hist_overlay_vars.get(varname, [])
+        if current_overlays:
+            m_remove_overlay = menu.addMenu("Remove overlay")
+            for ov in current_overlays:
+                units = self._get_var_units(ov)
+                label = f"{ov} [{units}]" if units else ov
+                a = QAction(label, self)
+                a.triggered.connect(partial(self._remove_overlay_from_hist_subplot, ov, varname))
+                m_remove_overlay.addAction(a)
+
+        menu.addSeparator()
+
+        # --- Remove this subplot ---
+        act_remove = QAction(f"Remove subplot ({varname})", self)
+        act_remove.triggered.connect(partial(self._remove_subplot_var, varname))
+        menu.addAction(act_remove)
+
+        return menu
+
+    def _set_hist_var_yscale(self, varname: str, mode: str) -> None:
+        """Set the y-axis scale for a time history variable."""
+        self._hist_yscale_by_var[varname] = mode
+        self.request_time_history_redraw()
+
+    def _add_var_to_hist_subplot(self, new_var: str, target_var: str) -> None:
+        """Add a variable to be overlaid on the target variable's time history subplot."""
+        if target_var not in self._hist_overlay_vars:
+            self._hist_overlay_vars[target_var] = []
+        if new_var not in self._hist_overlay_vars[target_var]:
+            self._hist_overlay_vars[target_var].append(new_var)
+        self.request_time_history_redraw()
+
+    def _remove_overlay_from_hist_subplot(self, overlay_var: str, target_var: str) -> None:
+        """Remove an overlaid variable from a time history subplot."""
+        if target_var in self._hist_overlay_vars:
+            if overlay_var in self._hist_overlay_vars[target_var]:
+                self._hist_overlay_vars[target_var].remove(overlay_var)
+            if not self._hist_overlay_vars[target_var]:
+                del self._hist_overlay_vars[target_var]
+        self.request_time_history_redraw()
 
     # ---------- Overlay buttons on plots (Option B) ----------
     def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
@@ -5083,8 +5232,11 @@ class Hermes3QtMainWindow(QMainWindow):
         For each selected variable we draw 2 subplots (rows):
         - upstream value vs time
         - target value vs time
+
+        Supports overlay variables and user-selected yscale via right-click menu.
         """
         self.hist_figure.clear()
+        self._hist_axes_by_var.clear()  # Reset axes tracking for right-click detection
         try:
             self.hist_figure.set_facecolor("white")
         except Exception:
@@ -5131,103 +5283,138 @@ class Hermes3QtMainWindow(QMainWindow):
         n_rows = 2
         gs = self.hist_figure.add_gridspec(nrows=n_rows, ncols=n_cols, hspace=0.35, wspace=0.30)
 
+        # Color cycle for overlays
+        default_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+
         last_time_ms = None
         for i, var in enumerate(vars_to_plot):
             ax_u = self.hist_figure.add_subplot(gs[0, i])
             ax_t = self.hist_figure.add_subplot(gs[1, i], sharex=ax_u)
+
+            # Store axes for right-click detection
+            self._hist_axes_by_var[var] = (ax_u, ax_t)
+
+            # Get overlay variables for this primary variable
+            overlay_vars = self._hist_overlay_vars.get(var, [])
+            all_vars_for_subplot = [var] + overlay_vars
 
             units = None
             # Choose a scale similar to convergence_functions (log if huge)
             log_threshold = 1e6
             max_abs = 0.0
 
-            for c in self.cases.values():
-                ds = c.ds
-                if var not in ds:
-                    continue
-                da = ds[var]
-                try:
-                    units = units or da.attrs.get("units", None)
-                except Exception:
-                    pass
+            # Plot each variable (primary + overlays)
+            for var_idx, plot_var in enumerate(all_vars_for_subplot):
+                color = default_colors[var_idx % len(default_colors)]
+                is_overlay = (var_idx > 0)
 
-                # Pick time dim
-                if tdim not in da.dims:
-                    # Not a time-varying variable -> skip
-                    continue
-
-                # Spatial dimension: try "y" then "pos" then inferred spatial dim
-                sdim = None
-                for cand in ("y", "pos", self.state.get("spatial_dim")):
-                    if cand and cand in da.dims:
-                        sdim = cand
-                        break
-                if sdim is None:
-                    continue
-
-                # Clamp indices (per-case, per-var)
-                n_s = int(ds.sizes.get(sdim, 0))
-                if n_s <= 0:
-                    continue
-                upi = upstream_index if upstream_index >= 0 else max(0, n_s + upstream_index)
-                tgi = target_index if target_index >= 0 else max(0, n_s + target_index)
-                upi = int(np.clip(upi, 0, n_s - 1))
-                tgi = int(np.clip(tgi, 0, n_s - 1))
-
-                # Cache key: (case_label, var, tdim, sdim, upi, tgi)
-                ck = (c.label, var, tdim, sdim, upi, tgi)
-                cached = self._hist_cache.get(ck)
-                if cached is None:
+                for c in self.cases.values():
+                    ds = c.ds
+                    if plot_var not in ds:
+                        continue
+                    da = ds[plot_var]
                     try:
-                        t_full = np.asarray(ds[tdim].values) * 1e3
-                        y_up_full = np.asarray(self._isel_1d_with_guard_replace(da, sdim=sdim, idx=upi).values).squeeze()
-                        y_tg_full = np.asarray(self._isel_1d_with_guard_replace(da, sdim=sdim, idx=tgi).values).squeeze()
-                        self._hist_cache[ck] = (t_full, y_up_full, y_tg_full)
-                        cached = self._hist_cache[ck]
+                        if not is_overlay:
+                            units = units or da.attrs.get("units", None)
                     except Exception:
+                        pass
+
+                    # Pick time dim
+                    if tdim not in da.dims:
+                        # Not a time-varying variable -> skip
                         continue
 
-                t_full, y_up_full, y_tg_full = cached
-                if t_full is None:
-                    continue
+                    # Spatial dimension: try "y" then "pos" then inferred spatial dim
+                    sdim = None
+                    for cand in ("y", "pos", self.state.get("spatial_dim")):
+                        if cand and cand in da.dims:
+                            sdim = cand
+                            break
+                    if sdim is None:
+                        continue
 
-                n_t = int(len(t_full))
-                if n_t <= 0:
-                    continue
-                n_sel = min(time_slices, n_t)
-                sl = slice(-n_sel, None)
-                tvals = t_full[sl]
-                y_up = y_up_full[sl]
-                y_tg = y_tg_full[sl]
+                    # Clamp indices (per-case, per-var)
+                    n_s = int(ds.sizes.get(sdim, 0))
+                    if n_s <= 0:
+                        continue
+                    upi = upstream_index if upstream_index >= 0 else max(0, n_s + upstream_index)
+                    tgi = target_index if target_index >= 0 else max(0, n_s + target_index)
+                    upi = int(np.clip(upi, 0, n_s - 1))
+                    tgi = int(np.clip(tgi, 0, n_s - 1))
 
-                # Downsample for responsiveness (keep last N points evenly)
-                try:
-                    if self._hist_max_points and len(tvals) > int(self._hist_max_points):
-                        stride = int(np.ceil(len(tvals) / float(self._hist_max_points)))
-                        tvals = tvals[::stride]
-                        y_up = y_up[::stride]
-                        y_tg = y_tg[::stride]
-                except Exception:
-                    pass
+                    # Cache key: (case_label, var, tdim, sdim, upi, tgi)
+                    ck = (c.label, plot_var, tdim, sdim, upi, tgi)
+                    cached = self._hist_cache.get(ck)
+                    if cached is None:
+                        try:
+                            t_full = np.asarray(ds[tdim].values) * 1e3
+                            y_up_full = np.asarray(self._isel_1d_with_guard_replace(da, sdim=sdim, idx=upi).values).squeeze()
+                            y_tg_full = np.asarray(self._isel_1d_with_guard_replace(da, sdim=sdim, idx=tgi).values).squeeze()
+                            self._hist_cache[ck] = (t_full, y_up_full, y_tg_full)
+                            cached = self._hist_cache[ck]
+                        except Exception:
+                            continue
 
-                # Track scale decision
-                try:
-                    max_abs = max(max_abs, float(np.nanmax(np.abs(y_up))), float(np.nanmax(np.abs(y_tg))))
-                except Exception:
-                    pass
+                    t_full, y_up_full, y_tg_full = cached
+                    if t_full is None:
+                        continue
 
-                ax_u.plot(tvals, y_up, "-", linewidth=1.5, label=c.label)
-                ax_t.plot(tvals, y_tg, "--", linewidth=1.5, label=c.label)
+                    n_t = int(len(t_full))
+                    if n_t <= 0:
+                        continue
+                    n_sel = min(time_slices, n_t)
+                    sl = slice(-n_sel, None)
+                    tvals = t_full[sl]
+                    y_up = y_up_full[sl]
+                    y_tg = y_tg_full[sl]
 
-                if tvals.size:
-                    last_time_ms = float(tvals[-1])
+                    # Downsample for responsiveness (keep last N points evenly)
+                    try:
+                        if self._hist_max_points and len(tvals) > int(self._hist_max_points):
+                            stride = int(np.ceil(len(tvals) / float(self._hist_max_points)))
+                            tvals = tvals[::stride]
+                            y_up = y_up[::stride]
+                            y_tg = y_tg[::stride]
+                    except Exception:
+                        pass
 
-            scale = "log" if (max_abs > log_threshold and max_abs > 0) else "linear"
+                    # Track scale decision (for auto mode)
+                    try:
+                        max_abs = max(max_abs, float(np.nanmax(np.abs(y_up))), float(np.nanmax(np.abs(y_tg))))
+                    except Exception:
+                        pass
+
+                    # Build label: include variable name for overlays, case label for multiple cases
+                    if is_overlay:
+                        if len(self.cases) > 1:
+                            label = f"{plot_var} ({c.label})"
+                        else:
+                            label = plot_var
+                    else:
+                        label = c.label if len(self.cases) > 1 else None
+
+                    ax_u.plot(tvals, y_up, "-", linewidth=1.5, label=label, color=color)
+                    ax_t.plot(tvals, y_tg, "--", linewidth=1.5, label=label, color=color)
+
+                    if tvals.size:
+                        last_time_ms = float(tvals[-1])
+
+            # Apply yscale - check user setting first, then fall back to auto
+            user_scale = self._hist_yscale_by_var.get(var, "auto")
+            if user_scale == "auto":
+                scale = "log" if (max_abs > log_threshold and max_abs > 0) else "linear"
+            else:
+                scale = user_scale
             ax_u.set_yscale(scale)
             ax_t.set_yscale(scale)
 
-            ax_u.set_title(f"Upstream {var}", fontsize=10)
-            ax_t.set_title(f"Target {var}", fontsize=10)
+            # Build title with overlay info
+            if overlay_vars:
+                title_suffix = f" + {len(overlay_vars)} overlay(s)"
+            else:
+                title_suffix = ""
+            ax_u.set_title(f"Upstream {var}{title_suffix}", fontsize=10)
+            ax_t.set_title(f"Target {var}{title_suffix}", fontsize=10)
             ax_t.set_xlabel("Time (ms)")
             # Variable name is already in the subplot title; keep y-label to units only.
             ylabel = f"({units})" if units else ""
@@ -5236,7 +5423,8 @@ class Hermes3QtMainWindow(QMainWindow):
             ax_u.grid(True, alpha=0.3)
             ax_t.grid(True, alpha=0.3)
 
-            if len(self.cases) > 1:
+            # Show legend if we have multiple cases or overlays
+            if len(self.cases) > 1 or overlay_vars:
                 ax_u.legend(loc="best", fontsize=8)
 
             # Hide x tick labels on top row
