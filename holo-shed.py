@@ -1198,6 +1198,17 @@ class Hermes3QtMainWindow(QMainWindow):
         self.poly_log_check.setChecked(False)
         poly_ctrl_layout.addWidget(self.poly_log_check)
 
+        cmap_row = QHBoxLayout()
+        cmap_row.addWidget(QLabel("colormap"))
+        self.poly_cmap_combo = QComboBox()
+        self.poly_cmap_combo.addItems([
+            "Spectral_r", "viridis", "plasma", "inferno", "magma", "cividis",
+            "coolwarm", "RdBu_r", "seismic", "hot", "jet", "turbo",
+        ])
+        self.poly_cmap_combo.setCurrentText("Spectral_r")
+        cmap_row.addWidget(self.poly_cmap_combo, 1)
+        poly_ctrl_layout.addLayout(cmap_row)
+
         clim_row = QHBoxLayout()
         clim_row.addWidget(QLabel("cbar min"))
         self.poly_vmin_edit = QLineEdit()
@@ -1393,6 +1404,7 @@ class Hermes3QtMainWindow(QMainWindow):
         self.poly_var_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_grid_only_check.toggled.connect(lambda _v: self.request_redraw())
         self.poly_log_check.toggled.connect(lambda _v: self.request_redraw())
+        self.poly_cmap_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.poly_apply_clim_btn.clicked.connect(self._apply_poly_clim)
         self.guard_replace_check.toggled.connect(lambda _v: self.request_redraw())
         self.guard_replace_check.toggled.connect(lambda _v: self.request_time_history_redraw())
@@ -3293,9 +3305,10 @@ class Hermes3QtMainWindow(QMainWindow):
         if not var or var not in ds_t:
             return case, ds_t, None
         logscale = bool(getattr(self, "poly_log_check", None).isChecked()) if hasattr(self, "poly_log_check") else False
+        cmap = str(getattr(self, "poly_cmap_combo", None).currentText() or "Spectral_r") if hasattr(self, "poly_cmap_combo") else "Spectral_r"
         vmin = self._poly_vmin_active
         vmax = self._poly_vmax_active
-        return case, ds_t, (var, logscale, vmin, vmax)
+        return case, ds_t, (var, logscale, cmap, vmin, vmax)
 
     def _update_region2d_overlay(self, kind: str) -> None:
         """
@@ -3310,8 +3323,8 @@ class Hermes3QtMainWindow(QMainWindow):
         if case is None or ds_t is None or bg is None or fig is None or canvas is None:
             return
 
-        var, logscale, vmin, vmax = bg
-        state_key = (case.label, var, bool(logscale), vmin, vmax)
+        var, logscale, cmap, vmin, vmax = bg
+        state_key = (case.label, var, bool(logscale), cmap, vmin, vmax)
 
         rebuild = (st.get("state") != state_key) or (st.get("ax") is None) or (st.get("polys") is None) or (st.get("line") is None)
 
@@ -3331,7 +3344,7 @@ class Hermes3QtMainWindow(QMainWindow):
                 data = ds_t[var]
                 data.hermesm.clean_guards().bout.polygon(
                     ax=ax,
-                    cmap="Spectral_r",
+                    cmap=cmap,
                     linecolor=(0, 0, 0, 0.10),
                     linewidth=0.0,
                     antialias=False,
@@ -4611,11 +4624,12 @@ class Hermes3QtMainWindow(QMainWindow):
         ds_t = self._ds_at_time(case)
         grid_only = bool(self.poly_grid_only_check.isChecked())
         logscale = bool(self.poly_log_check.isChecked())
+        cmap = str(self.poly_cmap_combo.currentText() or "Spectral_r")
         vmin = self._poly_vmin_active
         vmax = self._poly_vmax_active
 
         # Reuse the PatchCollection when only time index changes (fast).
-        state = (case.label, var, grid_only, logscale, vmin, vmax)
+        state = (case.label, var, grid_only, logscale, cmap, vmin, vmax)
         if self._poly_plot_state == state and self._poly_ax is not None and self._poly_polys is not None:
             try:
                 data = ds_t[var].hermesm.clean_guards()
@@ -4656,8 +4670,7 @@ class Hermes3QtMainWindow(QMainWindow):
             else:
                 data.hermesm.clean_guards().bout.polygon(
                     ax=ax,
-                    cmap="Spectral_r",
-                   
+                    cmap=cmap,
                     linecolor=(0, 0, 0, 0.15),
                     linewidth=0,
                     antialias=True,
