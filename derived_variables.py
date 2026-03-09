@@ -84,9 +84,9 @@ def compute_derived_variables(ds, requested_vars=None):
 # ============================================================================
 # Derived Variable Definitions
 # ============================================================================
-@register_derived_variable("eq_par_tot", description='Parallel heat flux density', units='W/m^2')
-def compute_eq_par_tot(ds):
-    """eq_par_tot = efe_tot_ylow / da"""
+@register_derived_variable("q_e_par_tot", description='Parallel e heat flux density', units='W/m^2')
+def compute_q_e_par_tot(ds):
+    """q_e_par_tot = efe_tot_ylow / da"""
     required = ['efe_tot_ylow', 'da']
     if not all(v in ds for v in required):
         return None
@@ -94,6 +94,25 @@ def compute_eq_par_tot(ds):
     eq_par_tot = ds['efe_tot_ylow'] / ds['da']
     return eq_par_tot
 
+
+@register_derived_variable("q_d+_par_tot", description='Parallel d+ heat flux density', units='W/m^2')
+def compute_q_dplus_par_tot(ds):
+    """q_d+_par_tot = efd+_tot_ylow / da"""
+    required = ['efd+_tot_ylow', 'da']
+    if not all(v in ds for v in required):
+        return None
+    dplus_par_tot = ds['efd+_tot_ylow'] / ds['da']
+    return dplus_par_tot
+
+
+@register_derived_variable("q_plas_par_tot", description='Parallel plasma heat flux density', units='W/m^2')
+def compute_q_plas_par_tot(ds):
+    """q_plas_par_tot = efd+_tot_ylow + efe_tot_ylow / da"""
+    required = ['efd+_tot_ylow', 'efe_tot_ylow', 'da']
+    if not all(v in ds for v in required):
+        return None
+    q_plas_par_tot = ds['efd+_tot_ylow'] + ds['efe_tot_ylow'] / ds['da']
+    return q_plas_par_tot
 
 @register_derived_variable('d+_particle_flux', description='d+ particle flux', units='m^-2 s^-1')
 def compute_dplus_particle_flux(ds):

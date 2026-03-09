@@ -4060,6 +4060,16 @@ class Hermes3QtMainWindow(QMainWindow):
         linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
         datasets_by_colour = self._datasets_by_colour()
 
+        # Build variable-to-color map for linestyle mode (same variable = same color across datasets)
+        var_colors: Dict[str, str] = {}
+        if not datasets_by_colour:
+            import matplotlib.pyplot as plt
+            color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+            all_vars = list(vars_to_plot) + all_overlay_vars
+            for vname in all_vars:
+                if vname not in var_colors:
+                    var_colors[vname] = color_cycle[len(var_colors) % len(color_cycle)]
+
         for case_idx, c in enumerate(self.cases.values()):
             ds_t = self._ds_at_time(c)
             ti = self._get_time_index_for_case(c)
@@ -4128,9 +4138,10 @@ class Hermes3QtMainWindow(QMainWindow):
                     case_color = line.get_color()
                     case_ls = linestyles[0]
                 else:
-                    # Datasets by linestyle: each dataset gets different linestyle
+                    # Datasets by linestyle: each dataset gets different linestyle, same color per variable
                     case_ls = linestyles[case_idx % len(linestyles)]
-                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls)
+                    var_color = var_colors.get(name)
+                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls, color=var_color)
                     case_color = line.get_color()
 
                 # Plot overlay variables
@@ -4145,8 +4156,9 @@ class Hermes3QtMainWindow(QMainWindow):
                             ls = linestyles[(ov_idx + 1) % len(linestyles)]
                             ax.plot(x, ov_y, label=ov_label, linestyle=ls, color=case_color)
                         else:
-                            # Overlays use different color, same linestyle per case
-                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls)
+                            # Overlays use same color per variable, different linestyle per case
+                            ov_color = var_colors.get(ov_name)
+                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls, color=ov_color)
                     except Exception:
                         pass
 
@@ -4341,6 +4353,16 @@ class Hermes3QtMainWindow(QMainWindow):
         linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
         datasets_by_colour = self._datasets_by_colour()
 
+        # Build variable-to-color map for linestyle mode (same variable = same color across datasets)
+        var_colors: Dict[str, str] = {}
+        if not datasets_by_colour:
+            import matplotlib.pyplot as plt
+            color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+            all_vars = list(vars_to_plot) + all_overlay_vars
+            for vname in all_vars:
+                if vname not in var_colors:
+                    var_colors[vname] = color_cycle[len(var_colors) % len(color_cycle)]
+
         for case_idx, c in enumerate(self.cases.values()):
             ds_t = self._ds_at_time(c)
             ti = self._get_time_index_for_case(c)
@@ -4447,9 +4469,10 @@ class Hermes3QtMainWindow(QMainWindow):
                     case_color = line.get_color()
                     case_ls = linestyles[0]
                 else:
-                    # Datasets by linestyle: each dataset gets different linestyle
+                    # Datasets by linestyle: each dataset gets different linestyle, same color per variable
                     case_ls = linestyles[case_idx % len(linestyles)]
-                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls)
+                    var_color = var_colors.get(name)
+                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls, color=var_color)
                     case_color = line.get_color()
 
                 # Plot overlay variables
@@ -4482,8 +4505,9 @@ class Hermes3QtMainWindow(QMainWindow):
                             ls = linestyles[(ov_idx + 1) % len(linestyles)]
                             ax.plot(x, ov_y, label=ov_label, linestyle=ls, color=case_color)
                         else:
-                            # Overlays use different color, same linestyle per case
-                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls)
+                            # Overlays use same color per variable, different linestyle per case
+                            ov_color = var_colors.get(ov_name)
+                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls, color=ov_color)
                     except Exception:
                         pass
 
@@ -5051,6 +5075,16 @@ class Hermes3QtMainWindow(QMainWindow):
             linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
             datasets_by_colour = self._datasets_by_colour()
 
+            # Build variable-to-color map for linestyle mode (same variable = same color across datasets)
+            var_colors: Dict[str, str] = {}
+            if not datasets_by_colour:
+                import matplotlib.pyplot as plt
+                color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+                all_vars = [name] + list(overlay_vars)
+                for vname in all_vars:
+                    if vname not in var_colors:
+                        var_colors[vname] = color_cycle[len(var_colors) % len(color_cycle)]
+
             for case_idx, c in enumerate(self.cases.values()):
                 ds = c.ds
                 if name not in ds:
@@ -5089,9 +5123,10 @@ class Hermes3QtMainWindow(QMainWindow):
                         line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0])
                         case_colors[c.label] = line.get_color()
                     else:
-                        # Datasets by linestyle: each dataset gets different linestyle, same color
+                        # Datasets by linestyle: each dataset gets different linestyle, same color per variable
                         ls = linestyles[case_idx % len(linestyles)]
-                        line, = ax.plot(x, y, label=plot_label, linestyle=ls)
+                        var_color = var_colors.get(name)
+                        line, = ax.plot(x, y, label=plot_label, linestyle=ls, color=var_color)
                         case_colors[c.label] = (line.get_color(), ls)
                 except Exception as e:
                     self.set_status(f"Plot error for {name}: {e}", is_error=True)
@@ -5130,10 +5165,11 @@ class Hermes3QtMainWindow(QMainWindow):
                             color = case_colors.get(c.label)
                             ax.plot(x, y, label=ov_label, linestyle=ls, color=color)
                         else:
-                            # Datasets by linestyle: overlays use different color, same linestyle per case
+                            # Datasets by linestyle: overlays use same color per variable, different linestyle per case
                             stored = case_colors.get(c.label)
                             ls = stored[1] if stored else linestyles[case_idx % len(linestyles)]
-                            ax.plot(x, y, label=ov_label, linestyle=ls)  # let matplotlib pick new color
+                            ov_color = var_colors.get(ov_name)
+                            ax.plot(x, y, label=ov_label, linestyle=ls, color=ov_color)
                     except Exception as e:
                         self.set_status(f"Overlay plot error for {ov_name}: {e}", is_error=True)
 
