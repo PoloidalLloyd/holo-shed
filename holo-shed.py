@@ -785,11 +785,18 @@ class Hermes3QtMainWindow(QMainWindow):
         self.setWindowTitle(f"Hermes-3 GUI (1D) - Qt ({_QT_API})")
 
         self.cases: Dict[str, _LoadedCase] = {}
-        self._case_time_indices: Dict[str, int] = {}  # per-case time indices
-        self._case_sliders: Dict[str, "QSlider"] = {}  # per-case slider widgets
-        self._case_spinboxes: Dict[str, "QSpinBox"] = {}  # per-case index spinbox widgets
-        self._case_ms_spinboxes: Dict[str, "QDoubleSpinBox"] = {}  # per-case time (ms) spinbox widgets
-        self._case_slider_widgets: Dict[str, "QWidget"] = {}  # per-case slider row widgets
+        self._case_time_indices: Dict[str, int] = {}  # per-case time indices (1D)
+        self._case_sliders: Dict[str, "QSlider"] = {}  # per-case slider widgets (1D)
+        self._case_spinboxes: Dict[str, "QSpinBox"] = {}  # per-case index spinbox widgets (1D)
+        self._case_ms_spinboxes: Dict[str, "QDoubleSpinBox"] = {}  # per-case time (ms) spinbox widgets (1D)
+        self._case_slider_widgets: Dict[str, "QWidget"] = {}  # per-case slider row widgets (1D)
+        # 2D per-case time slider tracking
+        self._case_time_indices_2d: Dict[str, int] = {}  # per-case time indices (2D)
+        self._case_sliders_2d: Dict[str, "QSlider"] = {}  # per-case slider widgets (2D)
+        self._case_spinboxes_2d: Dict[str, "QSpinBox"] = {}  # per-case index spinbox widgets (2D)
+        self._case_ms_spinboxes_2d: Dict[str, "QDoubleSpinBox"] = {}  # per-case time (ms) spinbox widgets (2D)
+        self._case_slider_widgets_2d: Dict[str, "QWidget"] = {}  # per-case slider row widgets (2D)
+        self._normalize_time_enabled: bool = False  # time normalization state
         self.spatial_dim_forced = spatial_dim
         self.state = dict(spatial_dim=None, time_dim=None, vars=[], t_values=None)
         self._mode_is_2d = False
@@ -877,6 +884,10 @@ class Hermes3QtMainWindow(QMainWindow):
         self._poly_ax = None
         self._poly_polys = None
         self._poly_cbar = None
+        # Multi-case 2D polygon tracking (for side-by-side comparison)
+        self._poly_axes_multi: Optional[List] = None
+        self._poly_polys_multi: Optional[List] = None
+        self._poly_cbars_multi: Optional[List] = None
         # Optional popout windows showing cut location on 2D colormap
         self._region2d_pol = None
         self._region2d_rad = None
@@ -947,6 +958,7 @@ class Hermes3QtMainWindow(QMainWindow):
             pass
 
         # Also move all per-case sliders (for synchronized arrow key control)
+        # Handle 1D per-case sliders
         for label, case_slider in self._case_sliders.items():
             try:
                 cv = int(case_slider.value()) + int(delta)
@@ -970,8 +982,34 @@ class Hermes3QtMainWindow(QMainWindow):
                     ms_spinbox.blockSignals(False)
             except Exception:
                 pass
+
+        # Handle 2D per-case sliders
+        for label, case_slider in self._case_sliders_2d.items():
+            try:
+                cv = int(case_slider.value()) + int(delta)
+                cv = max(int(case_slider.minimum()), min(int(case_slider.maximum()), cv))
+                case_slider.blockSignals(True)
+                case_slider.setValue(cv)
+                case_slider.blockSignals(False)
+                self._case_time_indices_2d[label] = cv
+                # Also update the index spinbox
+                spinbox = self._case_spinboxes_2d.get(label)
+                if spinbox is not None:
+                    spinbox.blockSignals(True)
+                    spinbox.setValue(cv)
+                    spinbox.blockSignals(False)
+                # Also update the ms spinbox
+                ms_spinbox = self._case_ms_spinboxes_2d.get(label)
+                if ms_spinbox is not None and label in self.cases:
+                    t_ms = self._get_time_ms_for_case(self.cases[label], cv)
+                    ms_spinbox.blockSignals(True)
+                    ms_spinbox.setValue(t_ms)
+                    ms_spinbox.blockSignals(False)
+            except Exception:
+                pass
+
         # Trigger single redraw after all sliders updated
-        if self._case_sliders:
+        if self._case_sliders or self._case_sliders_2d:
             self.request_redraw()
 
     # ---------- UI ----------
@@ -1023,6 +1061,12 @@ class Hermes3QtMainWindow(QMainWindow):
         style_row.addStretch(1)
         left_layout.addLayout(style_row)
 
+        # Option to normalize time to start from zero
+        self.normalize_time_check = QCheckBox("Normalize time (start from 0)")
+        self.normalize_time_check.setChecked(False)
+        self.normalize_time_check.stateChanged.connect(self._on_normalize_time_changed)
+        left_layout.addWidget(self.normalize_time_check)
+
         # Shared variable list (used for both Profiles and Time history)
         left_layout.addWidget(QLabel("Search variables"))
         self.search_edit = QLineEdit()
@@ -1051,6 +1095,13 @@ class Hermes3QtMainWindow(QMainWindow):
         time2d_layout.addWidget(QLabel("2D time index"))
 
         time2d_row = QHBoxLayout()
+        # Dataset name label for main 2D slider (shown when multiple datasets loaded)
+        self._main_slider_label_2d = QLabel("")
+        self._main_slider_label_2d.setMinimumWidth(60)
+        self._main_slider_label_2d.setMaximumWidth(120)
+        self._main_slider_label_2d.setVisible(False)
+        time2d_row.addWidget(self._main_slider_label_2d)
+
         self.time_slider_2d = QSlider(Qt.Orientation.Horizontal)
         self.time_slider_2d.setMinimum(0)
         self.time_slider_2d.setMaximum(0)
@@ -1092,6 +1143,14 @@ class Hermes3QtMainWindow(QMainWindow):
         self.time_readout_2d = QLabel("time index = 0", self.time2d_widget)
         self.time_readout_2d.setVisible(False)
         time2d_layout.addLayout(time2d_row)
+
+        # Container for per-case 2D time sliders (below main slider, populated dynamically)
+        self._case_sliders_container_2d = QWidget()
+        self._case_sliders_layout_2d = QVBoxLayout(self._case_sliders_container_2d)
+        self._case_sliders_layout_2d.setContentsMargins(0, 0, 0, 0)
+        self._case_sliders_layout_2d.setSpacing(2)
+        time2d_layout.addWidget(self._case_sliders_container_2d)
+
         self.time2d_widget.setVisible(False)
         left_layout.addWidget(self.time2d_widget)
 
@@ -1496,8 +1555,9 @@ class Hermes3QtMainWindow(QMainWindow):
 
         if self._mode_is_2d:
             self.setWindowTitle(f"Hermes-3 GUI (2D) - Qt ({_QT_API})")
+            # Keep add button enabled - 2D mode now supports up to 3 datasets for comparison
             try:
-                self.add_btn.setEnabled(False)
+                self.add_btn.setEnabled(True)
             except Exception:
                 pass
             self.plot_tabs.addTab(self._tab2d_poloidal, "Poloidal 1D")
@@ -1595,6 +1655,9 @@ class Hermes3QtMainWindow(QMainWindow):
             arr = np.asarray(tvals, dtype=float) * 1e3
             if arr.size == 0:
                 return None
+            # Apply normalization if enabled (search in normalized space)
+            if self._is_time_normalized() and arr.size > 0:
+                arr = arr - arr[0]
             # Use finite values for distance; map back to original indices
             finite_mask = np.isfinite(arr)
             if not np.any(finite_mask):
@@ -1607,6 +1670,22 @@ class Hermes3QtMainWindow(QMainWindow):
             return None
 
     def _set_time_ms_spin_for_index(self, ti: int) -> None:
+        # Use first case's time values with normalization support
+        if self.cases:
+            try:
+                first_case = next(iter(self.cases.values()))
+                clamped_ti = min(ti, first_case.n_time - 1)
+                ms = self._get_time_ms_for_case(first_case, clamped_ti)
+                spin = self._active_time_ms_spin()
+                spin.setEnabled(True)
+                spin.blockSignals(True)
+                spin.setValue(ms)
+                spin.blockSignals(False)
+                return
+            except Exception:
+                pass
+
+        # Fallback to state t_values if no cases loaded
         tvals = self.state.get("t_values")
         if tvals is None:
             try:
@@ -1619,6 +1698,9 @@ class Hermes3QtMainWindow(QMainWindow):
             if ti < 0 or ti >= tvals.size or not np.isfinite(tvals[ti]):
                 return
             ms = float(tvals[ti]) * 1e3
+            # Apply normalization if enabled
+            if self._is_time_normalized() and tvals.size > 0:
+                ms = ms - float(tvals[0]) * 1e3
             spin = self._active_time_ms_spin()
             spin.setEnabled(True)
             spin.blockSignals(True)
@@ -1679,18 +1761,20 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _on_time_slider_1d_changed(self, v: int) -> None:
         # Keep numeric input synced with slider
-        try:
-            self.time_spin.blockSignals(True)
-            self.time_spin.setValue(int(v))
-        finally:
-            try:
-                self.time_spin.blockSignals(False)
-            except Exception:
-                pass
-        try:
+        self.time_spin.blockSignals(True)
+        self.time_spin.setValue(int(v))
+        self.time_spin.blockSignals(False)
+
+        # Update ms spinbox using first dataset (with normalization support)
+        if self.cases:
+            first_case = next(iter(self.cases.values()))
+            clamped_v = min(int(v), first_case.n_time - 1)
+            t_ms = self._get_time_ms_for_case(first_case, clamped_v)
+            self.time_ms_spin.blockSignals(True)
+            self.time_ms_spin.setValue(t_ms)
+            self.time_ms_spin.blockSignals(False)
+        else:
             self._set_time_ms_spin_for_index(int(v))
-        except Exception:
-            pass
         self.request_redraw()
 
     # ---------- Status / datasets ----------
@@ -1762,6 +1846,12 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _update_case_sliders(self) -> None:
         """Create/update per-case time sliders when multiple datasets are loaded."""
+        # Update both 1D and 2D sliders
+        self._update_case_sliders_1d()
+        self._update_case_sliders_2d()
+
+    def _update_case_sliders_1d(self) -> None:
+        """Create/update per-case time sliders for 1D mode."""
         # Determine which labels should have per-case sliders (all except the first)
         case_labels = list(self.cases.keys())
         labels_needing_sliders = set(case_labels[1:]) if len(case_labels) > 1 else set()
@@ -1931,30 +2021,266 @@ class Hermes3QtMainWindow(QMainWindow):
                 self._case_slider_widgets[label] = row_widget
                 self._case_sliders_layout.addWidget(row_widget)
 
+    def _update_case_sliders_2d(self) -> None:
+        """Create/update per-case time sliders for 2D mode."""
+        # Determine which labels should have per-case sliders (all except the first)
+        case_labels = list(self.cases.keys())
+        labels_needing_sliders = set(case_labels[1:]) if len(case_labels) > 1 else set()
+
+        # Remove sliders for cases that no longer exist or became the first case
+        for label in list(self._case_slider_widgets_2d.keys()):
+            if label not in labels_needing_sliders:
+                widget = self._case_slider_widgets_2d.pop(label, None)
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+                self._case_sliders_2d.pop(label, None)
+                self._case_spinboxes_2d.pop(label, None)
+                self._case_ms_spinboxes_2d.pop(label, None)
+                self._case_time_indices_2d.pop(label, None)
+
+        # Only show per-case sliders when multiple 2D datasets are loaded
+        show_sliders = len(self.cases) > 1 and self._mode_is_2d
+        self._case_sliders_container_2d.setVisible(show_sliders)
+
+        # Update main 2D slider label (show first dataset name when multiple loaded)
+        if show_sliders and case_labels:
+            first_label = case_labels[0]
+            short_label = first_label if len(first_label) <= 20 else first_label[:17] + "..."
+            self._main_slider_label_2d.setText(short_label)
+            self._main_slider_label_2d.setToolTip(first_label)
+            self._main_slider_label_2d.setVisible(True)
+        else:
+            self._main_slider_label_2d.setVisible(False)
+
+        if not show_sliders:
+            return
+
+        # Add/update sliders for each case (skip first - it uses the main slider)
+        case_items = list(self.cases.items())
+        for label, c in case_items[1:]:
+            if label in self._case_slider_widgets_2d:
+                # Update existing slider range
+                slider = self._case_sliders_2d[label]
+                slider.blockSignals(True)
+                slider.setMaximum(max(0, c.n_time - 1))
+                # Clamp current value to valid range
+                current = self._case_time_indices_2d.get(label, c.n_time - 1)
+                current = min(current, c.n_time - 1)
+                slider.setValue(current)
+                self._case_time_indices_2d[label] = current
+                slider.blockSignals(False)
+                # Also update the spinbox
+                spinbox = self._case_spinboxes_2d.get(label)
+                if spinbox is not None:
+                    spinbox.blockSignals(True)
+                    spinbox.setRange(0, max(0, c.n_time - 1))
+                    spinbox.setValue(current)
+                    spinbox.blockSignals(False)
+                # Update the ms spinbox value
+                ms_spin = self._case_ms_spinboxes_2d.get(label)
+                if ms_spin is not None:
+                    t_ms = self._get_time_ms_for_case(c, current)
+                    ms_spin.blockSignals(True)
+                    ms_spin.setValue(t_ms)
+                    ms_spin.blockSignals(False)
+            else:
+                # Create new slider row
+                row_widget = QWidget()
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 2, 0, 2)
+                row_layout.setSpacing(4)
+
+                # Short label (truncate if needed)
+                short_label = label if len(label) <= 20 else label[:17] + "..."
+                lbl = QLabel(short_label)
+                lbl.setToolTip(label)
+                lbl.setMinimumWidth(60)
+                lbl.setMaximumWidth(120)
+                row_layout.addWidget(lbl)
+
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setMinimum(0)
+                slider.setMaximum(max(0, c.n_time - 1))
+                slider.setSingleStep(1)
+                slider.setPageStep(1)
+                # Initialize to final time step (like main slider)
+                initial_val = c.n_time - 1
+                slider.setValue(initial_val)
+                self._case_time_indices_2d[label] = initial_val
+                row_layout.addWidget(slider, 1)
+
+                # Index spinbox (matching main slider style)
+                row_layout.addWidget(QLabel("idx"))
+                spin = QSpinBox()
+                spin.setRange(0, max(0, c.n_time - 1))
+                spin.setValue(initial_val)
+                spin.setMinimumWidth(50)
+                spin.setMaximumWidth(60)
+                try:
+                    spin.setKeyboardTracking(False)
+                except Exception:
+                    pass
+                row_layout.addWidget(spin)
+
+                # Time (ms) spinbox
+                row_layout.addWidget(QLabel("t [ms]"))
+                ms_spin = QDoubleSpinBox()
+                ms_spin.setDecimals(4)
+                ms_spin.setSingleStep(0.1)
+                ms_spin.setRange(0.0, 1.0e12)
+                t_ms = self._get_time_ms_for_case(c, initial_val)
+                ms_spin.setValue(t_ms)
+                ms_spin.setMinimumWidth(70)
+                ms_spin.setMaximumWidth(90)
+                try:
+                    ms_spin.setKeyboardTracking(False)
+                except Exception:
+                    pass
+                row_layout.addWidget(ms_spin)
+
+                # Connect signals (use 2D-specific dicts)
+                def make_slider_handler_2d(case_label, spinbox, ms_spinbox, case_obj):
+                    def handler(v):
+                        self._case_time_indices_2d[case_label] = int(v)
+                        spinbox.blockSignals(True)
+                        spinbox.setValue(int(v))
+                        spinbox.blockSignals(False)
+                        # Update ms spinbox
+                        t_ms = self._get_time_ms_for_case(case_obj, int(v))
+                        ms_spinbox.blockSignals(True)
+                        ms_spinbox.setValue(t_ms)
+                        ms_spinbox.blockSignals(False)
+                        self.request_redraw()
+                    return handler
+
+                def make_spin_handler_2d(case_label, sldr, ms_spinbox, case_obj):
+                    def handler(v):
+                        self._case_time_indices_2d[case_label] = int(v)
+                        sldr.blockSignals(True)
+                        sldr.setValue(int(v))
+                        sldr.blockSignals(False)
+                        # Update ms spinbox
+                        t_ms = self._get_time_ms_for_case(case_obj, int(v))
+                        ms_spinbox.blockSignals(True)
+                        ms_spinbox.setValue(t_ms)
+                        ms_spinbox.blockSignals(False)
+                        self.request_redraw()
+                    return handler
+
+                def make_ms_spin_handler_2d(case_label, sldr, spinbox, case_obj):
+                    def handler(v):
+                        # Find nearest time index for this ms value
+                        ti = self._find_time_index_for_ms(case_obj, v)
+                        self._case_time_indices_2d[case_label] = ti
+                        sldr.blockSignals(True)
+                        sldr.setValue(ti)
+                        sldr.blockSignals(False)
+                        spinbox.blockSignals(True)
+                        spinbox.setValue(ti)
+                        spinbox.blockSignals(False)
+                        self.request_redraw()
+                    return handler
+
+                slider.valueChanged.connect(make_slider_handler_2d(label, spin, ms_spin, c))
+                spin.valueChanged.connect(make_spin_handler_2d(label, slider, ms_spin, c))
+                ms_spin.valueChanged.connect(make_ms_spin_handler_2d(label, slider, spin, c))
+
+                self._case_sliders_2d[label] = slider
+                self._case_spinboxes_2d[label] = spin
+                self._case_ms_spinboxes_2d[label] = ms_spin
+                self._case_slider_widgets_2d[label] = row_widget
+                self._case_sliders_layout_2d.addWidget(row_widget)
+
     def _get_time_ms_for_case(self, case: "_LoadedCase", ti: int) -> float:
         """Get the time in ms for a given time index in a case's dataset."""
-        try:
-            tdim = self.state.get("time_dim")
-            if tdim and tdim in case.ds.coords:
-                t_values = case.ds[tdim].values
-                if ti < len(t_values):
-                    return float(t_values[ti]) * 1e3  # Convert to ms
-        except Exception:
-            pass
+        # Try to get time values from the dataset
+        tdim = self.state.get("time_dim") or _infer_time_dim(case.ds)
+        if tdim and tdim in case.ds:
+            t_values = case.ds[tdim].values
+            if ti < len(t_values):
+                t_ms = float(t_values[ti]) * 1e3  # Convert to ms
+                # Apply normalization if enabled (t - t[0])
+                if self._is_time_normalized():
+                    t0_ms = float(t_values[0]) * 1e3
+                    t_ms = t_ms - t0_ms
+                return t_ms
         return 0.0
 
     def _find_time_index_for_ms(self, case: "_LoadedCase", t_ms: float) -> int:
         """Find the nearest time index for a given time in ms."""
         try:
-            tdim = self.state.get("time_dim")
-            if tdim and tdim in case.ds.coords:
+            tdim = self.state.get("time_dim") or _infer_time_dim(case.ds)
+            if tdim and tdim in case.ds:
                 t_values = case.ds[tdim].values * 1e3  # Convert to ms
+                # Apply normalization if enabled (search in normalized space)
+                if self._is_time_normalized():
+                    t0_ms = t_values[0]
+                    t_values = t_values - t0_ms
                 # Find nearest index
                 idx = int(np.argmin(np.abs(t_values - t_ms)))
                 return max(0, min(idx, case.n_time - 1))
         except Exception:
             pass
         return 0
+
+    def _is_time_normalized(self) -> bool:
+        """Check if time normalization is enabled."""
+        # Read checkbox state directly to avoid synchronization issues
+        try:
+            return bool(self.normalize_time_check.isChecked())
+        except Exception:
+            return getattr(self, '_normalize_time_enabled', False)
+
+    def _on_normalize_time_changed(self, state) -> None:
+        """Handle normalize time checkbox state change."""
+        # Store the state - check if non-zero (checked) or use isChecked() directly
+        # Qt.Checked = 2, Qt.Unchecked = 0, but PySide6 might pass enum
+        try:
+            self._normalize_time_enabled = bool(self.normalize_time_check.isChecked())
+        except Exception:
+            self._normalize_time_enabled = bool(state)
+        # Update all ms spinboxes to reflect the new normalization setting
+        self._update_all_time_displays()
+
+    def _update_all_time_displays(self) -> None:
+        """Update all time (ms) spinboxes to reflect current normalization setting."""
+        # Update main slider ms spinbox (uses first dataset)
+        ti = self._get_time_index()
+        if self.cases:
+            first_case = next(iter(self.cases.values()))
+            clamped_ti = min(ti, first_case.n_time - 1)
+            t_ms = self._get_time_ms_for_case(first_case, clamped_ti)
+            # Update the 1D ms spinbox directly
+            if hasattr(self, 'time_ms_spin') and self.time_ms_spin is not None:
+                self.time_ms_spin.blockSignals(True)
+                self.time_ms_spin.setValue(t_ms)
+                self.time_ms_spin.blockSignals(False)
+            # Update 2D spinbox if in 2D mode
+            if hasattr(self, 'time_ms_spin_2d') and self.time_ms_spin_2d is not None:
+                self.time_ms_spin_2d.blockSignals(True)
+                self.time_ms_spin_2d.setValue(t_ms)
+                self.time_ms_spin_2d.blockSignals(False)
+        else:
+            self._set_time_ms_spin_for_index(ti)
+
+        # Update 1D per-case ms spinboxes (each uses its own t[0] for normalization)
+        for label, ms_spin in self._case_ms_spinboxes.items():
+            if label in self.cases:
+                case_ti = self._case_time_indices.get(label, 0)
+                t_ms = self._get_time_ms_for_case(self.cases[label], case_ti)
+                ms_spin.blockSignals(True)
+                ms_spin.setValue(t_ms)
+                ms_spin.blockSignals(False)
+
+        # Update 2D per-case ms spinboxes
+        for label, ms_spin in self._case_ms_spinboxes_2d.items():
+            if label in self.cases:
+                case_ti = self._case_time_indices_2d.get(label, 0)
+                t_ms = self._get_time_ms_for_case(self.cases[label], case_ti)
+                ms_spin.blockSignals(True)
+                ms_spin.setValue(t_ms)
+                ms_spin.blockSignals(False)
 
     # ---------- Variables list ----------
     def _on_search_change(self, text: str) -> None:
@@ -3169,6 +3495,16 @@ class Hermes3QtMainWindow(QMainWindow):
         self._render_var_list()
         self._update_time_readout()
 
+    def _get_unique_case_label(self, label: str) -> str:
+        """Generate a unique label by adding numeric suffix if label already exists."""
+        if label not in self.cases:
+            return label
+        # Find the next available numeric suffix
+        i = 2
+        while f"{label} ({i})" in self.cases:
+            i += 1
+        return f"{label} ({i})"
+
     def load_dataset(self, *, replace: bool) -> None:
         p = (self.path_edit.text() or "").strip()
         if not p:
@@ -3186,13 +3522,25 @@ class Hermes3QtMainWindow(QMainWindow):
                         "Use 'Load dataset' (replace) to switch modes."
                     )
 
-            # For now keep 2D mode single-case (simplifies polygon + monitor plotting).
+            # Limit 2D mode to 3 cases for comparison (keeps plots readable)
             if self.cases and (not replace) and bool(next(iter(self.cases.values())).is_2d):
-                raise ValueError("2D mode currently supports a single loaded case. Use 'Load dataset' (replace).")
+                if len(self.cases) >= 3:
+                    raise ValueError("2D mode supports up to 3 datasets for comparison. Use 'Load dataset' (replace) to start fresh.")
 
             if replace:
                 self.cases.clear()
                 self._case_time_indices.clear()
+
+            # Ensure unique label by adding numeric suffix if needed
+            unique_label = self._get_unique_case_label(lc.label)
+            if unique_label != lc.label:
+                lc = _LoadedCase(
+                    label=unique_label,
+                    case_path=lc.case_path,
+                    ds=lc.ds,
+                    n_time=lc.n_time,
+                    is_2d=lc.is_2d,
+                )
             self.cases[lc.label] = lc
             self._update_after_load()
             self._update_datasets_list()
@@ -3231,10 +3579,17 @@ class Hermes3QtMainWindow(QMainWindow):
 
     def _get_time_index_for_case(self, case: _LoadedCase) -> int:
         # Use per-case time index if available (for multiple datasets)
-        if case.label in self._case_time_indices and len(self.cases) > 1:
-            ti = self._case_time_indices[case.label]
+        # Check appropriate dict based on current mode (1D vs 2D)
+        if self._mode_is_2d:
+            if case.label in self._case_time_indices_2d and len(self.cases) > 1:
+                ti = self._case_time_indices_2d[case.label]
+            else:
+                ti = self._get_time_index()
         else:
-            ti = self._get_time_index()
+            if case.label in self._case_time_indices and len(self.cases) > 1:
+                ti = self._case_time_indices[case.label]
+            else:
+                ti = self._get_time_index()
         return min(ti, case.n_time - 1)
 
     def _guard_replace_enabled(self) -> bool:
@@ -4854,12 +5209,13 @@ class Hermes3QtMainWindow(QMainWindow):
     def _redraw_2d_polygon(self) -> None:
         self._update_time_readout()
 
-        case = self._primary_case()
-        if case is None:
+        # Get all 2D cases (limit to 3 for comparison)
+        cases_2d = [c for c in self.cases.values() if getattr(c, 'is_2d', False)][:3]
+        if not cases_2d:
             self.poly_figure.clear()
             ax = self.poly_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
-            ax.text(0.5, 0.5, "No dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            ax.text(0.5, 0.5, "No 2D dataset loaded.", ha="center", va="center", transform=ax.transAxes)
             self.poly_canvas.draw_idle()
             return
 
@@ -4872,101 +5228,136 @@ class Hermes3QtMainWindow(QMainWindow):
             self.poly_canvas.draw_idle()
             return
 
-        ds_t = self._ds_at_time(case)
         grid_only = bool(self.poly_grid_only_check.isChecked())
         logscale = bool(self.poly_log_check.isChecked())
         cmap = str(self.poly_cmap_combo.currentText() or "Spectral_r")
         vmin = self._poly_vmin_active
         vmax = self._poly_vmax_active
 
-        # Reuse the PatchCollection when only time index changes (fast).
-        state = (case.label, var, grid_only, logscale, cmap, vmin, vmax)
-        if self._poly_plot_state == state and self._poly_ax is not None and self._poly_polys is not None:
+        n_cases = len(cases_2d)
+        # Build state key for settings (excludes time indices - those change frequently)
+        case_labels = tuple(c.label for c in cases_2d)
+        settings_state = (case_labels, var, grid_only, logscale, cmap, vmin, vmax)
+
+        # Reuse the PatchCollections when only time index changes (fast update).
+        if (self._poly_plot_state == settings_state and
+            self._poly_axes_multi is not None and
+            self._poly_polys_multi is not None and
+            len(self._poly_axes_multi) == n_cases):
             try:
-                data = ds_t[var].hermesm.clean_guards()
-                self._poly_polys.set_array(np.asarray(data.data).flatten())
-                if self._poly_cbar is not None:
-                    try:
-                        self._poly_cbar.update_normal(self._poly_polys)
-                    except Exception:
-                        pass
+                for i, case in enumerate(cases_2d):
+                    ds_t = self._ds_at_time(case)
+                    data = ds_t[var].hermesm.clean_guards()
+                    if self._poly_polys_multi[i] is not None:
+                        self._poly_polys_multi[i].set_array(np.asarray(data.data).flatten())
+                        if self._poly_cbars_multi and i < len(self._poly_cbars_multi) and self._poly_cbars_multi[i] is not None:
+                            try:
+                                self._poly_cbars_multi[i].update_normal(self._poly_polys_multi[i])
+                            except Exception:
+                                pass
                 self.poly_canvas.draw_idle()
                 return
             except Exception:
                 # fall through to rebuild
                 pass
 
-        # Otherwise rebuild the plot (variable/settings changed)
+        # Otherwise rebuild the plot (variable/settings changed or cases changed)
         self.poly_figure.clear()
         try:
             self.poly_figure.set_facecolor("white")
         except Exception:
             pass
-        ax = self.poly_figure.add_subplot(1, 1, 1)
+
+        # Initialize tracking lists for multi-case support
+        self._poly_axes_multi = []
+        self._poly_polys_multi = []
+        self._poly_cbars_multi = []
+
+        # Create side-by-side subplots (1 row, N columns)
+        for i, case in enumerate(cases_2d):
+            ax = self.poly_figure.add_subplot(1, n_cases, i + 1)
+            self._poly_axes_multi.append(ax)
+            ds_t = self._ds_at_time(case)
+
+            try:
+                data = ds_t[var]
+                # Short label for title
+                short_label = case.label if len(case.label) <= 25 else case.label[:22] + "..."
+
+                # Clean guards for nicer visuals and use xbout polygon plotting
+                if grid_only:
+                    data.hermesm.clean_guards().bout.polygon(
+                        ax=ax,
+                        grid_only=True,
+                        linecolor="k",
+                        linewidth=0.2,
+                        antialias=True,
+                        separatrix=False,
+                        targets=False,
+                        add_colorbar=False,
+                    )
+                    ax.set_title(f"{short_label}\n(grid)", fontsize=10)
+                    self._poly_polys_multi.append(None)
+                    self._poly_cbars_multi.append(None)
+                else:
+                    data.hermesm.clean_guards().bout.polygon(
+                        ax=ax,
+                        cmap=cmap,
+                        linecolor=(0, 0, 0, 0.15),
+                        linewidth=0,
+                        antialias=True,
+                        logscale=logscale,
+                        vmin=vmin,
+                        vmax=vmax,
+                        separatrix=True,
+                        separatrix_kwargs={"linewidth": 0.2, "color": "k"},
+                        targets=False,
+                        add_colorbar=False,
+                    )
+                    ax.set_title(f"{short_label}\n{var}", fontsize=10)
+                    # Create colorbar for each subplot
+                    try:
+                        polys = ax.collections[-1] if ax.collections else None
+                        self._poly_polys_multi.append(polys)
+                        if polys is not None:
+                            divider = make_axes_locatable(ax)
+                            cax = divider.append_axes("right", size="5%", pad=0.05)
+                            label = ""
+                            try:
+                                label = var
+                                if "units" in data.attrs:
+                                    label = f"{label} [{data.attrs['units']}]"
+                            except Exception:
+                                pass
+                            cbar = self.poly_figure.colorbar(polys, cax=cax, label=label if i == n_cases - 1 else "")
+                            self._poly_cbars_multi.append(cbar)
+                            try:
+                                cax.grid(which="both", visible=False)
+                            except Exception:
+                                pass
+                        else:
+                            self._poly_cbars_multi.append(None)
+                    except Exception:
+                        self._poly_cbars_multi.append(None)
+            except Exception as e:
+                ax.set_axis_off()
+                ax.text(0.5, 0.5, f"2D plot failed:\n{e}", ha="center", va="center", transform=ax.transAxes)
+                self._poly_polys_multi.append(None)
+                self._poly_cbars_multi.append(None)
+
+        # Adjust layout for side-by-side plots
         try:
-            data = ds_t[var]
-            # Clean guards for nicer visuals and use xbout polygon plotting
-            if grid_only:
-                data.hermesm.clean_guards().bout.polygon(
-                    ax=ax,
-                    grid_only=True,
-                    linecolor="k",
-                    linewidth=0.2,
-                    antialias=True,
-                    separatrix=False,
-                    targets=False,
-                    add_colorbar=False,
-                )
-                ax.set_title("Computational grid", fontsize=11)
-            else:
-                data.hermesm.clean_guards().bout.polygon(
-                    ax=ax,
-                    cmap=cmap,
-                    linecolor=(0, 0, 0, 0.15),
-                    linewidth=0,
-                    antialias=True,
-                    logscale=logscale,
-                    vmin=vmin,
-                    vmax=vmax,
-                    separatrix=True,
-                    separatrix_kwargs={"linewidth": 0.2, "color": "k"},
-                    targets=False,
-                    add_colorbar=False,
-                )
-                ax.set_title(f"{var}", fontsize=11)
-                # Create and keep our own colorbar so we can update it efficiently
-                try:
-                    polys = ax.collections[-1] if ax.collections else None
-                    if polys is not None:
-                        divider = make_axes_locatable(ax)
-                        cax = divider.append_axes("right", size="5%", pad=0.05)
-                        label = ""
-                        try:
-                            label = var
-                            if "units" in data.attrs:
-                                label = f"{label} [{data.attrs['units']}]"
-                        except Exception:
-                            pass
-                        self._poly_cbar = self.poly_figure.colorbar(polys, cax=cax, label=label)
-                        try:
-                            cax.grid(which="both", visible=False)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        except Exception as e:
-            ax.set_axis_off()
-            ax.text(0.5, 0.5, f"2D plot failed:\n{e}", ha="center", va="center", transform=ax.transAxes)
-        # Save handles for fast time updates
-        try:
-            self._poly_plot_state = state
-            self._poly_ax = ax
-            self._poly_polys = ax.collections[-1] if ax.collections else None
+            self.poly_figure.tight_layout()
         except Exception:
-            self._poly_plot_state = None
-            self._poly_ax = None
-            self._poly_polys = None
-            self._poly_cbar = None
+            pass
+
+        # Save state for fast time updates
+        self._poly_plot_state = settings_state
+        # Keep legacy single-case attributes for backwards compatibility
+        self._poly_ax = self._poly_axes_multi[0] if self._poly_axes_multi else None
+        self._poly_polys = self._poly_polys_multi[0] if self._poly_polys_multi else None
+        self._poly_cbar = self._poly_cbars_multi[0] if self._poly_cbars_multi else None
+
         self.poly_canvas.draw_idle()
 
     def _redraw_2d_monitor(self) -> None:
