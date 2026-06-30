@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Dict, List
+
 import numpy as np
 
 from src.dataset_utils import (
@@ -15,7 +17,7 @@ from src.dataset_utils import (
     xpoint_idx_bpxy_valley,
 )
 from src.models import LoadedCase
-from src.plotting.common import get_radial_profile
+from src.plotting.common import RADIAL_XLABEL, get_radial_profile, radial_distance_mm, resolve_profile_column
 
 def redraw_radial(win):
         win._update_time_readout()
@@ -23,14 +25,13 @@ def redraw_radial(win):
         # If nothing relevant changed since last draw, don't rebuild the figure.
         _view_restore = None
         try:
-            case = win._primary_case()
-            ti = win._get_time_index_for_case(case) if case else -1
+            case_info = win._all_case_time_state()
             region = str(win.rad_region_combo.currentText() or "omp")
             vars_to_plot = tuple(win.selected_vars)
             modes = tuple((v, win._yscale_by_var.get(v, "linear"), win._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
             # Include overlay variables in state key so view isn't restored when overlays change
             overlays = tuple((v, tuple(win._overlay_vars.get(v, []))) for v in vars_to_plot)
-            state_key = ("rad", getattr(case, "label", None), ti, region, vars_to_plot, modes, overlays)
+            state_key = ("rad", case_info, region, vars_to_plot, modes, overlays)
             if win._last_draw_state_2d.get("rad") == state_key and win.rad_figure.axes:
                 try:
                     win._position_overlay_buttons_rad()
@@ -39,7 +40,7 @@ def redraw_radial(win):
                 win.rad_canvas.draw_idle()
                 return
             # Preserve zoom/pan across time changes (same config, different ti)
-            state_no_ti = ("rad", getattr(case, "label", None), region, vars_to_plot, modes, overlays)
+            state_no_ti = ("rad", tuple(label for label, _ in case_info), region, vars_to_plot, modes, overlays)
             _view_restore = win._maybe_capture_view_2d(kind="rad", state_key_no_ti=state_no_ti)
             win._last_draw_state_2d["rad"] = state_key
         except Exception:
@@ -142,7 +143,10 @@ def redraw_radial(win):
                 win._rad_cache[ck] = df
             else:
                 try:
-                    missing = [v for v in params if v not in df.columns]
+                    missing = [
+                        v for v in params
+                        if resolve_profile_column(c, v, df) is None
+                    ]
                 except Exception:
                     missing = list(params)
                 if missing:
@@ -154,9 +158,10 @@ def redraw_radial(win):
                             params=list(missing),
                         )
                         for v in list(missing):
-                            if v in df_new:
+                            col = resolve_profile_column(c, v, df_new) if df_new is not None else None
+                            if col is not None and df_new is not None:
                                 try:
-                                    df[v] = df_new[v].values
+                                    df[v] = df_new[col].values
                                 except Exception:
                                     pass
                         win._rad_cache[ck] = df
@@ -165,33 +170,31 @@ def redraw_radial(win):
             if df is None:
                 continue
 
-            # Add radial-only derived variables directly from dataset
-            # These have dims (x,) or (x, time) and aren't extracted by the selector
-            all_needed_vars = list(vars_to_plot) + list(all_overlay_vars)
-            for vname in all_needed_vars:
-                if vname in df.columns:
-                    continue  # Already extracted
-                if vname not in ds_t:
-                    continue  # Not in dataset
-                try:
-                    da = ds_t[vname]
-                    dims = tuple(da.dims)
-                    # Check if it's a radial-only variable (has 'x' dim but not 'theta')
-                    if 'x' in dims and 'theta' not in dims and 'y' not in dims:
-                        # Extract values - should align with df's x indices
-                        if len(dims) == 1 and dims[0] == 'x':
-                            vals = np.asarray(da.values)
-                        else:
-                            # Has other dims (shouldn't happen for radial-only)
-                            continue
-                        # Check length matches
-                        if len(vals) == len(df):
-                            df[vname] = vals
-                except Exception:
-                    pass
+            x = radial_distance_mm(df)
+            if x is None:
+                win.set_status("Radial extract missing Srad/dist coordinate.", is_error=True)
+                continue
 
-            # Plot radial coordinate in mm
-            x = np.asarray(df["Srad"].values) * 1e3
+            # Hermes-only: radial-only derived variables from xarray dataset
+            if getattr(c, "backend_kind", "hermes") != "solps":
+                all_needed_vars = list(vars_to_plot) + list(all_overlay_vars)
+                for vname in all_needed_vars:
+                    if resolve_profile_column(c, vname, df) is not None:
+                        continue
+                    if vname not in ds_t:
+                        continue
+                    try:
+                        da = ds_t[vname]
+                        dims = tuple(da.dims)
+                        if 'x' in dims and 'theta' not in dims and 'y' not in dims:
+                            if len(dims) == 1 and dims[0] == 'x':
+                                vals = np.asarray(da.values)
+                            else:
+                                continue
+                            if len(vals) == len(df):
+                                df[vname] = vals
+                    except Exception:
+                        pass
 
             for ax, name in zip(axes, vars_to_plot):
                 overlay_vars = win._overlay_vars.get(name, [])
@@ -202,13 +205,14 @@ def redraw_radial(win):
                 ax.set_title(title, fontsize=10)
                 ax.grid(True, alpha=0.3)
 
-                # Try to get y values from dataframe, or directly from dataset for radial-only vars
+                col = resolve_profile_column(c, name, df)
                 y = None
-                try:
-                    y = np.asarray(df[name].values)
-                except Exception:
-                    pass
-                if y is None and name in ds_t:
+                if col is not None:
+                    try:
+                        y = np.asarray(df[col].values)
+                    except Exception:
+                        pass
+                if y is None and getattr(c, "backend_kind", "hermes") != "solps" and name in ds_t:
                     # Try to extract radial-only derived variable directly
                     try:
                         da = ds_t[name]
@@ -245,11 +249,13 @@ def redraw_radial(win):
                 # Plot overlay variables
                 for ov_idx, ov_name in enumerate(overlay_vars):
                     ov_y = None
-                    try:
-                        ov_y = np.asarray(df[ov_name].values)
-                    except Exception:
-                        pass
-                    if ov_y is None and ov_name in ds_t:
+                    ov_col = resolve_profile_column(c, ov_name, df)
+                    if ov_col is not None:
+                        try:
+                            ov_y = np.asarray(df[ov_col].values)
+                        except Exception:
+                            pass
+                    if ov_y is None and getattr(c, "backend_kind", "hermes") != "solps" and ov_name in ds_t:
                         # Try to extract radial-only derived variable directly
                         try:
                             da = ds_t[ov_name]
@@ -283,32 +289,29 @@ def redraw_radial(win):
             units = None
             for c in win.cases.values():
                 try:
-                    if name in c.ds:
+                    if hasattr(c.ds, "data_vars") and name in c.ds:
                         units = c.ds[name].attrs.get("units", None)
                         if units:
                             break
                 except Exception:
                     continue
             ax.set_ylabel(f"{units}" if units else "")
-            # Show legend if multiple cases or overlays
-            overlay_vars = win._overlay_vars.get(name, [])
-            if len(win.cases) > 1 or overlay_vars:
-                ax.legend(loc="best", fontsize=8)
-            ax.set_xlabel(r"$r^\prime - r_{sep}$ (mm)")
-            # Separatrix marker
+            ax.set_xlabel(RADIAL_XLABEL)
             try:
-                ax.axvline(0.0, color="k", linestyle="--", linewidth=1.0)
-                ax.text(
+                ax.axvline(
                     0.0,
-                    0.98,
-                    "separatrix",
-                    rotation=90,
-                    transform=ax.get_xaxis_transform(),
-                    va="top",
-                    ha="left",
-                    fontsize=8,
                     color="k",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label="separatrix",
+                    zorder=1,
                 )
+            except Exception:
+                pass
+
+            overlay_vars = win._overlay_vars.get(name, [])
+            try:
+                ax.legend(loc="best", fontsize=8)
             except Exception:
                 pass
 

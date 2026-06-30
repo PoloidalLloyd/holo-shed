@@ -75,12 +75,12 @@ def test_detect_backend_missing_dir(tmp_path: Path):
         detect_backend(missing)
 
 
-def test_solps_backend_stub(tmp_path: Path):
+def test_solps_backend_missing_balance(tmp_path: Path):
     from src.backends.solps import SolpsBackend
 
     backend = SolpsBackend()
     assert backend.kind == "solps"
-    with pytest.raises(NotImplementedError, match="SOLPS"):
+    with pytest.raises(FileNotFoundError, match="balance.nc"):
         backend.load(tmp_path)
 
 
@@ -96,6 +96,63 @@ def test_plot_coordinator_routes():
 
     assert hasattr(PlotCoordinator, "redraw_profiles")
     assert hasattr(PlotCoordinator, "redraw_2d_poloidal")
+
+
+def test_merge_case_variable_sets_union():
+    from src.dataset_utils import merge_case_variable_sets
+
+    a = {"Te", "Ne", "Bpxy"}
+    b = {"Te", "Ne", "Vd+"}
+    assert merge_case_variable_sets([a, b], mixed_backends=False) == ["Bpxy", "Ne", "Te", "Vd+"]
+
+
+def test_merge_case_variable_sets_intersection():
+    from src.dataset_utils import merge_case_variable_sets
+
+    a = {"Te", "Ne", "Bpxy"}
+    b = {"Te", "Ne", "Vd+"}
+    assert merge_case_variable_sets([a, b], mixed_backends=True) == ["Ne", "Te"]
+
+
+def test_format_case_display_label():
+    from src.dataset_utils import format_case_display_label
+    from src.models import LoadedCase
+
+    hermes = LoadedCase(label="run_a", case_path="/a", ds=None, is_2d=True, backend_kind="hermes")
+    solps = LoadedCase(label="run_b", case_path="/b", ds=None, is_2d=True, backend_kind="solps")
+    assert format_case_display_label(hermes) == "run_a (Hermes 2D)"
+    assert format_case_display_label(solps) == "run_b (SOLPS 2D)"
+
+
+def test_resolve_profile_column_case_insensitive():
+    import pandas as pd
+    from src.models import LoadedCase
+    from src.plotting.common import resolve_profile_column
+
+    case = LoadedCase(label="s", case_path="/s", ds=None, is_2d=True, backend_kind="solps")
+    df = pd.DataFrame({"Te": [1.0], "Ne": [2.0]})
+    assert resolve_profile_column(case, "te", df) == "Te"
+    assert resolve_profile_column(case, "Ne", df) == "Ne"
+    assert resolve_profile_column(case, "missing", df) is None
+
+
+def test_params_with_requested_geometry():
+    from src.dataset_utils import params_with_requested_geometry, selector_params_only
+
+    assert selector_params_only(["Te", "R", "Z"]) == ["Te"]
+    assert params_with_requested_geometry(["Te", "R", "Z"]) == ["Z", "R", "Te"]
+
+
+def test_radial_distance_mm_solps_dist():
+    import pandas as pd
+    from src.plotting.common import RADIAL_XLABEL, radial_distance_mm
+
+    df = pd.DataFrame({"dist": [0.0, 0.01, 0.02], "Te": [1.0, 2.0, 3.0]})
+    x = radial_distance_mm(df)
+    assert x is not None
+    assert len(x) == 3
+    assert float(x[1]) == 10.0
+    assert "sep" in RADIAL_XLABEL and "mm" in RADIAL_XLABEL
 
 
 def test_ylim_with_margin():

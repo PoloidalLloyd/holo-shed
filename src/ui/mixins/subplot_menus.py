@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
-from src.ui.qt import QAction, QMenu, QPoint, Qt, qt_checked, qt_unchecked
+from src.ui.qt import QAction, QApplication, QMenu, QPoint, Qt, qt_checked, qt_unchecked
 
 _qt_checked = qt_checked
 _qt_unchecked = qt_unchecked
@@ -27,7 +28,46 @@ class SubplotMenusMixin:
         for var, ax_obj in axes_map.items():
             if ax_obj is ax:
                 return var
+        # Fallback when axes were recreated but the subplot grid is unchanged.
+        try:
+            fig = ax.get_figure()
+            plot_axes = [a for a in fig.axes if a.get_visible()]
+            if ax in plot_axes:
+                idx = plot_axes.index(ax)
+                vars_to_plot = list(getattr(self, "selected_vars", []))
+                if 0 <= idx < len(vars_to_plot):
+                    return vars_to_plot[idx]
+        except Exception:
+            pass
         return None
+
+    def _is_right_click(self, event) -> bool:
+        try:
+            if int(event.button) == 3:
+                return True
+        except Exception:
+            pass
+        try:
+            from matplotlib.backend_bases import MouseButton
+
+            return event.button == MouseButton.RIGHT
+        except Exception:
+            return False
+
+    def _is_shift_held(self, event=None) -> bool:
+        """Check if Shift is held (matplotlib event key first, then Qt modifiers)."""
+        if event is not None:
+            try:
+                key = getattr(event, "key", None)
+                if key is not None and "shift" in str(key).lower():
+                    return True
+            except Exception:
+                pass
+        try:
+            mods = QApplication.keyboardModifiers()
+            return bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        except Exception:
+            return False
 
     def _build_subplot_context_menu(self, varname: str, ax, canvas_type: str = "main") -> "QMenu":
         """Build context menu for a subplot showing the given variable."""
@@ -171,28 +211,11 @@ class SubplotMenusMixin:
         self.request_redraw()
         self.request_time_history_redraw()
 
-    def _is_shift_held(self) -> bool:
-        """Check if Shift key is currently held using Qt."""
-        try:
-            from PyQt6.QtWidgets import QApplication
-            mods = QApplication.keyboardModifiers()
-            return bool(mods & Qt.KeyboardModifier.ShiftModifier)
-        except Exception:
-            pass
-        try:
-            from PySide6.QtWidgets import QApplication
-            mods = QApplication.keyboardModifiers()
-            return bool(mods & Qt.KeyboardModifier.ShiftModifier)
-        except Exception:
-            pass
-        return False
-
     def _on_canvas_button_press(self, event) -> None:
         """Handle Shift+right-click on the main 1D profiles canvas for context menu."""
-        if event.button != 3:  # Right-click only
+        if not self._is_right_click(event):
             return
-        # Require Shift modifier to avoid interfering with matplotlib zoom
-        if not self._is_shift_held():
+        if not self._is_shift_held(event):
             return
         if event.inaxes is None:
             return
@@ -200,7 +223,6 @@ class SubplotMenusMixin:
         if varname is None:
             return
         menu = self._build_subplot_context_menu(varname, event.inaxes, canvas_type="main")
-        # Convert matplotlib coords to Qt global coords
         global_pos = self.canvas.mapToGlobal(
             QPoint(int(event.x), int(self.canvas.height() - event.y))
         )
@@ -208,9 +230,9 @@ class SubplotMenusMixin:
 
     def _on_pol_canvas_button_press(self, event) -> None:
         """Handle Shift+right-click on the 2D poloidal canvas for context menu."""
-        if event.button != 3:
+        if not self._is_right_click(event):
             return
-        if not self._is_shift_held():
+        if not self._is_shift_held(event):
             return
         if event.inaxes is None:
             return
@@ -225,9 +247,9 @@ class SubplotMenusMixin:
 
     def _on_rad_canvas_button_press(self, event) -> None:
         """Handle Shift+right-click on the 2D radial canvas for context menu."""
-        if event.button != 3:
+        if not self._is_right_click(event):
             return
-        if not self._is_shift_held():
+        if not self._is_shift_held(event):
             return
         if event.inaxes is None:
             return
@@ -244,10 +266,9 @@ class SubplotMenusMixin:
 
     def _on_hist_canvas_button_press(self, event) -> None:
         """Handle Shift+right-click on the time history canvas for context menu."""
-        if event.button != 3:  # Right-click only
+        if not self._is_right_click(event):
             return
-        # Require Shift modifier to avoid interfering with matplotlib zoom
-        if not self._is_shift_held():
+        if not self._is_shift_held(event):
             return
         if event.inaxes is None:
             return

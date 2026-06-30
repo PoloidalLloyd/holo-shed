@@ -39,13 +39,22 @@ class VariableListMixin:
                 ds = getattr(c, "ds", None)
                 if ds is None:
                     continue
-                if varname in ds:
-                    try:
+                if getattr(c, "backend_kind", "") == "solps":
+                    bal = getattr(ds, "bal", None)
+                    if isinstance(bal, dict) and varname in bal:
+                        return None
+                    continue
+                try:
+                    if hasattr(ds, "data_vars") and varname in ds.data_vars:
                         units = ds[varname].attrs.get("units", None)
                         if units:
                             return units
-                    except Exception:
-                        pass
+                    elif hasattr(ds, "coords") and varname in ds.coords:
+                        units = ds[varname].attrs.get("units", None)
+                        if units:
+                            return units
+                except Exception:
+                    pass
         return None
 
     def _item_text_for_var(self, name: str) -> str:

@@ -343,33 +343,55 @@ class TimeControlsMixin:
                 pass
             self.request_redraw()
 
+    def _time_values_for_case(self, case: "LoadedCase"):
+        """Return (time_dim_name, time_values_seconds) for a loaded case."""
+        backend = case.backend
+        if backend is not None:
+            tdim, tvals = backend.time_coordinate(case)
+            try:
+                return tdim, np.asarray(tvals, dtype=float)
+            except Exception:
+                return tdim, None
+
+        ds = case.ds
+        tdim = self.state.get("time_dim") or infer_time_dim(ds)
+        if tdim is None:
+            return None, None
+        try:
+            if hasattr(ds, "coords") and tdim in ds.coords:
+                return tdim, np.asarray(ds[tdim].values, dtype=float)
+        except Exception:
+            pass
+        try:
+            if tdim in ds:
+                return tdim, np.asarray(ds[tdim].values, dtype=float)
+        except Exception:
+            pass
+        return tdim, None
+
     def _get_time_ms_for_case(self, case: "LoadedCase", ti: int) -> float:
         """Get the time in ms for a given time index in a case's dataset."""
-        # Try to get time values from the dataset
-        tdim = self.state.get("time_dim") or infer_time_dim(case.ds)
-        if tdim and tdim in case.ds:
-            t_values = case.ds[tdim].values
-            if ti < len(t_values):
-                t_ms = float(t_values[ti]) * 1e3  # Convert to ms
-                # Apply normalization if enabled (t - t[0])
-                if self._is_time_normalized():
-                    t0_ms = float(t_values[0]) * 1e3
-                    t_ms = t_ms - t0_ms
-                return t_ms
+        _tdim, t_values = self._time_values_for_case(case)
+        if t_values is not None and ti < len(t_values):
+            t_ms = float(t_values[ti]) * 1e3  # Convert to ms
+            # Apply normalization if enabled (t - t[0])
+            if self._is_time_normalized():
+                t0_ms = float(t_values[0]) * 1e3
+                t_ms = t_ms - t0_ms
+            return t_ms
         return 0.0
 
     def _find_time_index_for_ms(self, case: "LoadedCase", t_ms: float) -> int:
         """Find the nearest time index for a given time in ms."""
         try:
-            tdim = self.state.get("time_dim") or infer_time_dim(case.ds)
-            if tdim and tdim in case.ds:
-                t_values = case.ds[tdim].values * 1e3  # Convert to ms
+            _tdim, t_values = self._time_values_for_case(case)
+            if t_values is not None:
+                t_ms_arr = np.asarray(t_values, dtype=float) * 1e3  # Convert to ms
                 # Apply normalization if enabled (search in normalized space)
                 if self._is_time_normalized():
-                    t0_ms = t_values[0]
-                    t_values = t_values - t0_ms
+                    t_ms_arr = t_ms_arr - t_ms_arr[0]
                 # Find nearest index
-                idx = int(np.argmin(np.abs(t_values - t_ms)))
+                idx = int(np.argmin(np.abs(t_ms_arr - t_ms)))
                 return max(0, min(idx, case.n_time - 1))
         except Exception:
             pass

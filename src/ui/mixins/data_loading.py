@@ -8,10 +8,13 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from src.dataset_utils import (
+    cases_have_mixed_backends,
     infer_spatial_dim,
     infer_time_dim,
     list_plottable_vars,
     list_plottable_vars_2d,
+    merge_case_variable_sets,
+    time_reference_case,
 )
 from src.models import LoadedCase
 
@@ -25,23 +28,38 @@ class DataLoadingMixin:
     def _recompute_all_vars(self) -> Tuple[List[str], Optional[str], Optional[str]]:
         if not self.cases:
             return [], None, None
-        first_case = next(iter(self.cases.values()))
-        first = first_case.ds
-        tdim = infer_time_dim(first)
+
+        case_list = list(self.cases.values())
+        first_case = case_list[0]
+        mixed = cases_have_mixed_backends(self.cases)
         is_2d = bool(getattr(first_case, "is_2d", False))
+        var_sets: List[set[str]] = []
+        tdim: Optional[str] = None
 
-        if is_2d:
-            # 2D Hermes-3 typically uses dims ('x','theta') (+ optional time dim)
-            all_vars = set(list_plottable_vars_2d(first, time_dim=tdim))
-            for c in list(self.cases.values())[1:]:
-                all_vars |= set(list_plottable_vars_2d(c.ds, time_dim=tdim))
-            return sorted(all_vars), "theta", tdim
+        for c in case_list:
+            if c.backend is not None:
+                tdim_c, _tvals = c.backend.time_coordinate(c)
+                var_sets.append(set(c.backend.list_variables(c)))
+            else:
+                ds = c.ds
+                tdim_c = infer_time_dim(ds)
+                if is_2d:
+                    var_sets.append(set(list_plottable_vars_2d(ds, time_dim=tdim_c)))
+                else:
+                    sdim_c = self.spatial_dim_forced or infer_spatial_dim(ds)
+                    var_sets.append(set(list_plottable_vars(ds, spatial_dim=sdim_c, time_dim=tdim_c)))
 
-        sdim = self.spatial_dim_forced or infer_spatial_dim(first)
-        all_vars = set(list_plottable_vars(first, spatial_dim=sdim, time_dim=tdim))
-        for c in list(self.cases.values())[1:]:
-            all_vars |= set(list_plottable_vars(c.ds, spatial_dim=sdim, time_dim=tdim))
-        return sorted(all_vars), sdim, tdim
+        ref = time_reference_case(self.cases)
+        if ref is not None and ref.backend is not None:
+            tdim, _tvals = ref.backend.time_coordinate(ref)
+        elif ref is not None:
+            tdim = infer_time_dim(ref.ds)
+        else:
+            tdim = None
+
+        all_vars = merge_case_variable_sets(var_sets, mixed_backends=mixed)
+        sdim = "theta" if is_2d else (self.spatial_dim_forced or infer_spatial_dim(first_case.ds))
+        return all_vars, sdim, tdim
 
     def _set_time_range(self, n_t: int) -> None:
         n_t = max(1, int(n_t))
@@ -99,9 +117,9 @@ class DataLoadingMixin:
         self.state["time_dim"] = tdim
 
         # Switch UI mode to match data dimensionality
+        first_case = next(iter(self.cases.values()), None)
         try:
-            first_case = next(iter(self.cases.values()))
-            is_2d = bool(getattr(first_case, "is_2d", False))
+            is_2d = bool(getattr(first_case, "is_2d", False)) if first_case is not None else False
         except Exception:
             is_2d = False
         if bool(is_2d) != bool(self._mode_is_2d):
@@ -122,14 +140,22 @@ class DataLoadingMixin:
             self.selected_vars = []
             self._selected_set = set()
 
-        # Time axis values from the first dataset (for display)
-        ds0 = next(iter(self.cases.values())).ds
+        # Time axis for readouts: use the longest transient case, not load order.
+        ref_case = time_reference_case(self.cases) or first_case
         t_values = None
-        if tdim is not None and tdim in ds0.coords:
+        if ref_case is not None and ref_case.backend is not None:
+            _tdim, tvals = ref_case.backend.time_coordinate(ref_case)
             try:
-                t_values = np.asarray(ds0[tdim].values)
+                t_values = np.asarray(tvals, dtype=float)
             except Exception:
                 t_values = None
+        elif ref_case is not None:
+            ds0 = ref_case.ds
+            if tdim is not None and hasattr(ds0, "coords") and tdim in ds0.coords:
+                try:
+                    t_values = np.asarray(ds0[tdim].values)
+                except Exception:
+                    t_values = None
         self.state["t_values"] = t_values
 
         # Slider range based on maximum time steps across cases
@@ -155,6 +181,52 @@ class DataLoadingMixin:
         self._render_var_list()
         self._update_time_readout()
 
+    def _invalidate_plot_caches(self) -> None:
+        for attr in (
+            "_hist_cache",
+            "_mon_cache",
+            "_pol_cache",
+            "_rad_cache",
+            "_pol_ylim_cache",
+            "_rad_ylim_cache",
+            "_1d_ylim_cache",
+        ):
+            try:
+                getattr(self, attr).clear()
+            except Exception:
+                pass
+        try:
+            self._last_draw_state_2d = {"pol": None, "rad": None, "poly": None, "mon": None}
+        except Exception:
+            pass
+
+    def remove_case(self, label: str) -> None:
+        """Remove one loaded case from the session."""
+        if label not in self.cases:
+            return
+        self.cases.pop(label)
+        self._case_time_indices.pop(label, None)
+        self._case_time_indices_2d.pop(label, None)
+        self._case_arrow_keys_enabled.pop(label, None)
+
+        if not self.cases:
+            self.state = dict(spatial_dim=None, time_dim=None, vars=[], t_values=None)
+            self.selected_vars = []
+            self._selected_set = set()
+            self._mode_is_2d = False
+            self._configure_tabs(is_2d=False)
+            self._render_var_list()
+            self._update_time_readout()
+            self.set_status("Enter a case directory path and click 'Load case'.")
+        else:
+            self._update_after_load()
+            self._sync_main_arrow_keys_checkboxes()
+            self.set_status("")
+
+        self._update_datasets_list()
+        self._invalidate_plot_caches()
+        self.request_full_redraw()
+
     def _get_unique_case_label(self, label: str) -> str:
         """Generate a unique label by adding numeric suffix if label already exists."""
         if label not in self.cases:
@@ -179,13 +251,13 @@ class DataLoadingMixin:
                 if bool(lc.is_2d) != bool(existing_is_2d):
                     raise ValueError(
                         "Cannot mix 1D and 2D cases in the same session. "
-                        "Use 'Load dataset' (replace) to switch modes."
+                        "Use 'New session' to switch modes."
                     )
 
             # Limit 2D mode to 3 cases for comparison (keeps plots readable)
             if self.cases and (not replace) and bool(next(iter(self.cases.values())).is_2d):
                 if len(self.cases) >= 3:
-                    raise ValueError("2D mode supports up to 3 datasets for comparison. Use 'Load dataset' (replace) to start fresh.")
+                    raise ValueError("2D mode supports up to 3 datasets for comparison. Use 'New session' to start fresh.")
 
             if replace:
                 self.cases.clear()
@@ -201,29 +273,15 @@ class DataLoadingMixin:
             self._update_after_load()
             self._sync_main_arrow_keys_checkboxes()
             self._update_datasets_list()
-            self.set_status("")
-            self.request_redraw()
-            # New dataset -> invalidate cached time history and redraw (debounced)
-            try:
-                self._hist_cache.clear()
-            except Exception:
-                pass
-            try:
-                self._mon_cache.clear()
-            except Exception:
-                pass
-            try:
-                self._pol_cache.clear()
-                self._rad_cache.clear()
-            except Exception:
-                pass
-            try:
-                self._pol_ylim_cache.clear()
-                self._rad_ylim_cache.clear()
-                self._1d_ylim_cache.clear()
-            except Exception:
-                pass
-            self.request_time_history_redraw()
+            if cases_have_mixed_backends(self.cases) and not self.state.get("vars"):
+                self.set_status(
+                    "Mixed Hermes + SOLPS session: no common plottable variables found.",
+                    is_error=True,
+                )
+            else:
+                self.set_status("")
+            self._invalidate_plot_caches()
+            self.request_full_redraw()
         except Exception as e:
             self.set_status(f"Failed to load dataset: {e}", is_error=True)
 
