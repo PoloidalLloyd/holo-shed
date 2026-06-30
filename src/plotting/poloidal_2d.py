@@ -23,8 +23,7 @@ def redraw_poloidal(win):
         # If nothing relevant changed since last draw, don't rebuild the figure.
         _view_restore = None
         try:
-            case = win._primary_case()
-            ti = win._get_time_index_for_case(case) if case else -1
+            case_info = win._all_case_time_state()
             region = str(win.pol_region_combo.currentText() or "outer_lower")
             sepadd = int(win.pol_sepadd_spin.value())
             use_spol = bool(getattr(win, "pol_use_spol_check", None).isChecked()) if hasattr(win, "pol_use_spol_check") else False
@@ -33,7 +32,7 @@ def redraw_poloidal(win):
             modes = tuple((v, win._yscale_by_var.get(v, "linear"), win._ylim_mode_by_var.get(v, "auto")) for v in vars_to_plot)
             # Include overlay variables in state key so view isn't restored when overlays change
             overlays = tuple((v, tuple(win._overlay_vars.get(v, []))) for v in vars_to_plot)
-            state_key = ("pol", getattr(case, "label", None), ti, region, sepadd, use_spol, xpt_mode, vars_to_plot, modes, overlays)
+            state_key = ("pol", case_info, region, sepadd, use_spol, xpt_mode, vars_to_plot, modes, overlays)
             if win._last_draw_state_2d.get("pol") == state_key and win.pol_figure.axes:
                 try:
                     win._position_overlay_buttons_pol()
@@ -42,7 +41,17 @@ def redraw_poloidal(win):
                 win.pol_canvas.draw_idle()
                 return
             # Preserve zoom/pan across time changes (same config, different ti)
-            state_no_ti = ("pol", getattr(case, "label", None), region, sepadd, use_spol, xpt_mode, vars_to_plot, modes, overlays)
+            state_no_ti = (
+                "pol",
+                tuple(label for label, _ in case_info),
+                region,
+                sepadd,
+                use_spol,
+                xpt_mode,
+                vars_to_plot,
+                modes,
+                overlays,
+            )
             _view_restore = win._maybe_capture_view_2d(kind="pol", state_key_no_ti=state_no_ti)
             win._last_draw_state_2d["pol"] = state_key
         except Exception:

@@ -269,7 +269,7 @@ class MainWindow(
             self.path_edit.setText(str(initial_case_path))
             self.load_dataset(replace=True)
         else:
-            self.set_status("Enter a case directory path and click 'Load dataset'.")
+            self.set_status("Enter a case directory path and click 'Load case'.")
             self.redraw()
             self.request_time_history_redraw()
 
@@ -320,6 +320,33 @@ class MainWindow(
             # Fallback: redraw immediately
             self._do_redraw_time_history()
 
+    def request_full_redraw(self) -> None:
+        """Redraw every plot view (e.g. after loading or removing a case)."""
+        if self._mode_is_2d:
+            for redraw in (
+                self._redraw_2d_poloidal,
+                self._redraw_2d_radial,
+                self._redraw_2d_polygon,
+                self._redraw_2d_monitor,
+            ):
+                try:
+                    redraw()
+                except Exception:
+                    pass
+            try:
+                if self._region2d_pol:
+                    self._update_region2d_overlay("pol")
+            except Exception:
+                pass
+            try:
+                if self._region2d_rad:
+                    self._update_region2d_overlay("rad")
+            except Exception:
+                pass
+        else:
+            self.request_redraw()
+            self.request_time_history_redraw()
+
     def request_redraw(self) -> None:
         """
         Immediate redraw for the currently active plot tab.
@@ -340,19 +367,36 @@ class MainWindow(
             pass
 
     def _update_datasets_list(self) -> None:
+        layout = self._datasets_list_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
         if not self.cases:
-            self.datasets_label.setText("Loaded datasets: (none)")
+            self.datasets_header.setText("Loaded datasets: (none)")
             self._update_case_sliders()
             return
-        labels = [f"{c.label}{' (2D)' if getattr(c, 'is_2d', False) else ' (1D)'}" for c in self.cases.values()]
-        if len(labels) <= 2:
-            items = "\n".join(f"- {lbl}" for lbl in labels)
-            self.datasets_label.setText(f"Loaded datasets ({len(labels)}):\n{items}")
-        else:
-            shown = "\n".join(f"- {lbl}" for lbl in labels[:2])
-            self.datasets_label.setText(
-                f"Loaded datasets ({len(labels)}):\n{shown}\n... and {len(labels) - 2} more"
-            )
+
+        from src.dataset_utils import format_case_display_label
+
+        n = len(self.cases)
+        self.datasets_header.setText(f"Loaded datasets ({n}):")
+        for label, case in self.cases.items():
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            name_lbl = QLabel(format_case_display_label(case))
+            name_lbl.setToolTip(label)
+            name_lbl.setWordWrap(True)
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(72)
+            remove_btn.clicked.connect(partial(self.remove_case, label))
+            row_layout.addWidget(name_lbl, 1)
+            row_layout.addWidget(remove_btn)
+            layout.addWidget(row)
         self._update_case_sliders()
 
 
@@ -575,6 +619,9 @@ class MainWindow(
         return result
 
     # ---------- 2D plotting ----------
+    def _all_case_time_state(self) -> tuple:
+        return tuple((c.label, self._get_time_index_for_case(c)) for c in self.cases.values())
+
     def _primary_case(self) -> Optional[LoadedCase]:
         if not self.cases:
             return None
@@ -594,10 +641,20 @@ class MainWindow(
         if not last:
             return None
         try:
-            # Both pol and rad state tuples are of the form:
-            #   (kind, label, ti, ...rest...)
-            # We strip ti generically so adding new fields doesn't break zoom-preserve.
-            last_no_ti = (last[0], last[1], *last[3:])
+            if (
+                isinstance(last, tuple)
+                and len(last) >= 2
+                and isinstance(last[1], tuple)
+                and last[1]
+                and isinstance(last[1][0], tuple)
+                and len(last[1][0]) == 2
+            ):
+                # (kind, [(label, ti), ...], ...rest)
+                labels_only = tuple(label for label, _ in last[1])
+                last_no_ti = (last[0], labels_only, *last[2:])
+            else:
+                # Legacy: (kind, label, ti, ...rest)
+                last_no_ti = (last[0], last[1], *last[3:])
             if kind == "pol":
                 axes_map = self._overlay_axes_by_var_pol
                 fig_axes = set(getattr(self.pol_figure, "axes", []))
@@ -712,6 +769,10 @@ class MainWindow(
         Like _ds_at_time(), but for an explicit time index (used for ylim computations).
         Ensures sdtools metadata/options survive slicing.
         """
+        backend = case.backend
+        if backend is not None and case.backend_kind == "solps":
+            return backend.ds_at_time_index(case, int(ti))
+
         ds = case.ds
         tdim = self.state.get("time_dim")
         if tdim and tdim in getattr(ds, "dims", {}):
@@ -747,6 +808,10 @@ class MainWindow(
 
 
     def _ds_at_time(self, case: LoadedCase):
+        backend = case.backend
+        if backend is not None and case.backend_kind == "solps":
+            return backend.ds_at_time_index(case, self._get_time_index_for_case(case))
+
         ds = case.ds
         tdim = self.state.get("time_dim")
         if tdim and tdim in getattr(ds, "dims", {}):

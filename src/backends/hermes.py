@@ -14,6 +14,7 @@ from src.dataset_utils import (
     infer_time_dim,
     list_plottable_vars,
     list_plottable_vars_2d,
+    params_with_requested_geometry,
     parse_mesh_grid_filename_from_bout_inp,
     probe_is_2d_case,
     selector_params_only,
@@ -191,8 +192,17 @@ class HermesBackend:
             ensure_sdtools_2d_metadata(ds_t)
         except Exception:
             pass
-        p = selector_params_only(list(params))
-        return get_1d_radial_data(ds_t, params=p, region=region)
+        p = params_with_requested_geometry(list(params))
+        df = get_1d_radial_data(ds_t, params=p, region=region)
+        if (
+            any(name in ("R", "Z") for name in params)
+            and "R" in df.columns
+            and "Z" not in df.columns
+            and str(region) in ("omp", "imp", "outer_midplane", "inner_midplane")
+        ):
+            df = df.copy()
+            df["Z"] = 0.0
+        return df
 
     def plot_2d_field(
         self, case: LoadedCase, *, param: str, ax: Any, time_index: int, **plot_kw: Any

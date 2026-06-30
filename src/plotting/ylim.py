@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from src.models import LoadedCase
-from src.plotting.common import get_poloidal_profile, get_radial_profile
+from src.plotting.common import get_poloidal_profile, get_radial_profile, resolve_profile_column
 
 
 def with_margin(ymin: float, ymax: float) -> Tuple[float, float]:
@@ -132,9 +132,12 @@ def compute_ylim_radial_extracted(
     if hit is not None:
         return hit
 
-    def _accum_from_df(df, vname, cur_min, cur_max):
+    def _accum_from_df(df, case, vname, cur_min, cur_max):
+        col = resolve_profile_column(case, vname, df)
+        if col is None:
+            return cur_min, cur_max
         try:
-            y = np.asarray(df[vname].values, dtype=float)
+            y = np.asarray(df[col].values, dtype=float)
         except Exception:
             return cur_min, cur_max
         if yscale == "log":
@@ -177,7 +180,10 @@ def compute_ylim_radial_extracted(
             win._rad_cache[ck] = df
         else:
             try:
-                missing = [v for v in all_vars if v not in df.columns]
+                missing = [
+                    v for v in all_vars
+                    if resolve_profile_column(case, v, df) is None
+                ]
             except Exception:
                 missing = all_vars
             if missing:
@@ -190,15 +196,16 @@ def compute_ylim_radial_extracted(
                     )
                     if df_new is not None:
                         for v in missing:
-                            if v in df_new:
-                                df[v] = df_new[v].values
+                            col = resolve_profile_column(case, v, df_new)
+                            if col is not None:
+                                df[v] = df_new[col].values
                     win._rad_cache[ck] = df
                 except Exception:
                     pass
         if df is None:
             continue
         for vname in all_vars:
-            ymin, ymax = _accum_from_df(df, vname, ymin, ymax)
+            ymin, ymax = _accum_from_df(df, case, vname, ymin, ymax)
 
     if ymin is None or ymax is None:
         out = (None, None)

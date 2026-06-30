@@ -43,10 +43,10 @@ class LayoutMixin:
 
         # Buttons row
         btn_row = QHBoxLayout()
-        self.load_btn = QPushButton("Load dataset")
-        self.add_btn = QPushButton("Load additional")
+        self.load_btn = QPushButton("Load case")
+        self.new_session_btn = QPushButton("New session")
         btn_row.addWidget(self.load_btn)
-        btn_row.addWidget(self.add_btn)
+        btn_row.addWidget(self.new_session_btn)
         left_layout.addLayout(btn_row)
 
         # Status + datasets
@@ -54,9 +54,15 @@ class LayoutMixin:
         self.status_label.setWordWrap(True)
         left_layout.addWidget(self.status_label)
 
-        self.datasets_label = QLabel("Loaded datasets: (none)")
-        self.datasets_label.setWordWrap(True)
-        left_layout.addWidget(self.datasets_label)
+        self.datasets_header = QLabel("Loaded datasets:")
+        left_layout.addWidget(self.datasets_header)
+        self.datasets_list_host = QWidget()
+        self._datasets_list_layout = QVBoxLayout(self.datasets_list_host)
+        self._datasets_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._datasets_list_layout.setSpacing(2)
+        left_layout.addWidget(self.datasets_list_host)
+        # Legacy alias (some code may still reference datasets_label)
+        self.datasets_label = self.datasets_header
 
         # Plot style option: datasets by colour or linestyle
         style_row = QHBoxLayout()
@@ -505,8 +511,8 @@ class LayoutMixin:
         main_layout.addWidget(splitter)
 
         # Wire signals
-        self.load_btn.clicked.connect(lambda: self.load_dataset(replace=True))
-        self.add_btn.clicked.connect(lambda: self.load_dataset(replace=False))
+        self.load_btn.clicked.connect(lambda: self.load_dataset(replace=False))
+        self.new_session_btn.clicked.connect(lambda: self.load_dataset(replace=True))
         self.deselect_btn.clicked.connect(self.deselect_all_vars)
 
         self.search_edit.textChanged.connect(self._on_search_change)
@@ -524,6 +530,7 @@ class LayoutMixin:
         self.time_ms_spin_2d.valueChanged.connect(self._on_time_ms_spin_2d_changed)
         self.pol_region_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_redraw())
+        self.pol_sepadd_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
         self.pol_use_spol_check.toggled.connect(lambda _v: self.request_redraw())
         self.pol_xpoint_combo.currentIndexChanged.connect(lambda _i: self.request_redraw())
         self.pol_show_region2d_check.toggled.connect(self._on_pol_show_region2d_toggled)
@@ -579,7 +586,7 @@ class LayoutMixin:
             self.setWindowTitle(f"Hermes-3 GUI (2D) - Qt ({_QT_API})")
             # Keep add button enabled - 2D mode now supports up to 3 datasets for comparison
             try:
-                self.add_btn.setEnabled(True)
+                self.new_session_btn.setEnabled(True)
             except Exception:
                 pass
             self.plot_tabs.addTab(self._tab2d_poloidal, "Poloidal 1D")
@@ -616,7 +623,7 @@ class LayoutMixin:
             except Exception:
                 pass
             try:
-                self.add_btn.setEnabled(True)
+                self.new_session_btn.setEnabled(True)
             except Exception:
                 pass
             self.plot_tabs.addTab(self._tab1d_profiles, "Profiles")

@@ -14,7 +14,147 @@ from src.dataset_utils import (
     selector_params_only,
     xpoint_idx_bpxy_valley,
 )
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 from src.models import LoadedCase
+
+
+def _plot_polygon_hermes(win, case, ax, *, var, grid_only, logscale, cmap, vmin, vmax, n_cases, i):
+    ds_t = win._ds_at_time(case)
+    data = ds_t[var]
+    short_label = case.label if len(case.label) <= 25 else case.label[:22] + "..."
+
+    if grid_only:
+        data.hermesm.clean_guards().bout.polygon(
+            ax=ax,
+            grid_only=True,
+            linecolor="k",
+            linewidth=0.2,
+            antialias=True,
+            separatrix=False,
+            targets=False,
+            add_colorbar=False,
+        )
+        ax.set_title(f"{short_label}\n(grid)", fontsize=10)
+        return None, None
+
+    data.hermesm.clean_guards().bout.polygon(
+        ax=ax,
+        cmap=cmap,
+        linecolor=(0, 0, 0, 0.15),
+        linewidth=0,
+        antialias=True,
+        logscale=logscale,
+        vmin=vmin,
+        vmax=vmax,
+        separatrix=True,
+        separatrix_kwargs={"linewidth": 0.2, "color": "k"},
+        targets=False,
+        add_colorbar=False,
+    )
+    ax.set_title(f"{short_label}\n{var}", fontsize=10)
+    polys = ax.collections[-1] if ax.collections else None
+    cbar = None
+    if polys is not None:
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        label = var
+        try:
+            if "units" in data.attrs:
+                label = f"{label} [{data.attrs['units']}]"
+        except Exception:
+            pass
+        cbar = win.poly_figure.colorbar(polys, cax=cax, label=label if i == n_cases - 1 else "")
+        try:
+            cax.grid(which="both", visible=False)
+        except Exception:
+            pass
+    return polys, cbar
+
+
+def _plot_polygon_solps(win, case, ax, *, var, grid_only, logscale, cmap, vmin, vmax, n_cases, i):
+    backend = case.backend
+    if backend is None:
+        raise RuntimeError(f"Case {case.label} has no backend attached")
+    ti = win._get_time_index_for_case(case)
+    backend.plot_2d_field(
+        case,
+        param=var,
+        ax=ax,
+        time_index=ti,
+        grid_only=grid_only,
+        logscale=logscale,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        cbar=False,
+    )
+    short_label = case.label if len(case.label) <= 25 else case.label[:22] + "..."
+    title = f"{short_label}\n(grid)" if grid_only else f"{short_label}\n{var}"
+    ax.set_title(title, fontsize=10)
+    polys = ax.collections[-1] if ax.collections else None
+    cbar = None
+    if polys is not None and not grid_only:
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        cbar = win.poly_figure.colorbar(polys, cax=cax, label=var if i == n_cases - 1 else "")
+        try:
+            cax.grid(which="both", visible=False)
+        except Exception:
+            pass
+    return polys, cbar
+
+
+def plot_region2d_background(
+    win,
+    case: LoadedCase,
+    ax,
+    *,
+    var: str,
+    logscale: bool,
+    cmap: str,
+    vmin,
+    vmax,
+):
+    """Draw a 2D field background for the region-overlay popout (no colorbar)."""
+    if getattr(case, "backend_kind", "hermes") == "solps":
+        backend = case.backend
+        if backend is None:
+            raise RuntimeError(f"Case {case.label} has no backend attached")
+        ti = win._get_time_index_for_case(case)
+        backend.plot_2d_field(
+            case,
+            param=var,
+            ax=ax,
+            time_index=ti,
+            grid_only=False,
+            logscale=logscale,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            cbar=False,
+            separatrix=True,
+        )
+        return ax.collections[-1] if ax.collections else None
+
+    ds_t = win._ds_at_time(case)
+    data = ds_t[var]
+    data.hermesm.clean_guards().bout.polygon(
+        ax=ax,
+        cmap=cmap,
+        linecolor=(0, 0, 0, 0.10),
+        linewidth=0.0,
+        antialias=False,
+        logscale=bool(logscale),
+        vmin=vmin,
+        vmax=vmax,
+        separatrix=True,
+        separatrix_kwargs={"linewidth": 0.6, "color": "k"},
+        targets=False,
+        add_colorbar=False,
+    )
+    return ax.collections[-1] if ax.collections else None
+
 
 def redraw_polygon(win):
         win._update_time_readout()
@@ -49,8 +189,10 @@ def redraw_polygon(win):
         case_labels = tuple(c.label for c in cases_2d)
         settings_state = (case_labels, var, grid_only, logscale, cmap, vmin, vmax)
 
-        # Reuse the PatchCollections when only time index changes (fast update).
-        if (win._poly_plot_state == settings_state and
+        # Reuse the PatchCollections when only time index changes (fast update; Hermes only).
+        all_hermes = all(getattr(c, "backend_kind", "hermes") != "solps" for c in cases_2d)
+        if (all_hermes and
+            win._poly_plot_state == settings_state and
             win._poly_axes_multi is not None and
             win._poly_polys_multi is not None and
             len(win._poly_axes_multi) == n_cases):
@@ -87,68 +229,38 @@ def redraw_polygon(win):
         for i, case in enumerate(cases_2d):
             ax = win.poly_figure.add_subplot(1, n_cases, i + 1)
             win._poly_axes_multi.append(ax)
-            ds_t = win._ds_at_time(case)
 
             try:
-                data = ds_t[var]
-                # Short label for title
-                short_label = case.label if len(case.label) <= 25 else case.label[:22] + "..."
-
-                # Clean guards for nicer visuals and use xbout polygon plotting
-                if grid_only:
-                    data.hermesm.clean_guards().bout.polygon(
-                        ax=ax,
-                        grid_only=True,
-                        linecolor="k",
-                        linewidth=0.2,
-                        antialias=True,
-                        separatrix=False,
-                        targets=False,
-                        add_colorbar=False,
-                    )
-                    ax.set_title(f"{short_label}\n(grid)", fontsize=10)
-                    win._poly_polys_multi.append(None)
-                    win._poly_cbars_multi.append(None)
-                else:
-                    data.hermesm.clean_guards().bout.polygon(
-                        ax=ax,
-                        cmap=cmap,
-                        linecolor=(0, 0, 0, 0.15),
-                        linewidth=0,
-                        antialias=True,
+                if getattr(case, "backend_kind", "hermes") == "solps":
+                    polys, cbar = _plot_polygon_solps(
+                        win,
+                        case,
+                        ax,
+                        var=var,
+                        grid_only=grid_only,
                         logscale=logscale,
+                        cmap=cmap,
                         vmin=vmin,
                         vmax=vmax,
-                        separatrix=True,
-                        separatrix_kwargs={"linewidth": 0.2, "color": "k"},
-                        targets=False,
-                        add_colorbar=False,
+                        n_cases=n_cases,
+                        i=i,
                     )
-                    ax.set_title(f"{short_label}\n{var}", fontsize=10)
-                    # Create colorbar for each subplot
-                    try:
-                        polys = ax.collections[-1] if ax.collections else None
-                        win._poly_polys_multi.append(polys)
-                        if polys is not None:
-                            divider = make_axes_locatable(ax)
-                            cax = divider.append_axes("right", size="5%", pad=0.05)
-                            label = ""
-                            try:
-                                label = var
-                                if "units" in data.attrs:
-                                    label = f"{label} [{data.attrs['units']}]"
-                            except Exception:
-                                pass
-                            cbar = win.poly_figure.colorbar(polys, cax=cax, label=label if i == n_cases - 1 else "")
-                            win._poly_cbars_multi.append(cbar)
-                            try:
-                                cax.grid(which="both", visible=False)
-                            except Exception:
-                                pass
-                        else:
-                            win._poly_cbars_multi.append(None)
-                    except Exception:
-                        win._poly_cbars_multi.append(None)
+                else:
+                    polys, cbar = _plot_polygon_hermes(
+                        win,
+                        case,
+                        ax,
+                        var=var,
+                        grid_only=grid_only,
+                        logscale=logscale,
+                        cmap=cmap,
+                        vmin=vmin,
+                        vmax=vmax,
+                        n_cases=n_cases,
+                        i=i,
+                    )
+                win._poly_polys_multi.append(polys)
+                win._poly_cbars_multi.append(cbar)
             except Exception as e:
                 ax.set_axis_off()
                 ax.text(0.5, 0.5, f"2D plot failed:\n{e}", ha="center", va="center", transform=ax.transAxes)

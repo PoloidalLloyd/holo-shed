@@ -4,9 +4,40 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import numpy as np
+
+
+def merge_case_variable_sets(var_sets: List[Set[str]], *, mixed_backends: bool) -> List[str]:
+    """Union variable names within one backend; intersect when comparing Hermes vs SOLPS."""
+    if not var_sets:
+        return []
+    if mixed_backends:
+        merged = set.intersection(*var_sets)
+    else:
+        merged = set().union(*var_sets)
+    return sorted(merged)
+
+
+def format_case_display_label(case) -> str:
+    kind = getattr(case, "backend_kind", "hermes")
+    dim = "2D" if getattr(case, "is_2d", False) else "1D"
+    backend = "SOLPS" if kind == "solps" else "Hermes"
+    return f"{case.label} ({backend} {dim})"
+
+
+def cases_have_mixed_backends(cases) -> bool:
+    kinds = {getattr(c, "backend_kind", "hermes") for c in cases.values()}
+    return len(kinds) > 1
+
+
+def time_reference_case(cases) -> Optional[object]:
+    """Case with the longest time axis — used for session readouts (order-independent)."""
+    if not cases:
+        return None
+    return max(cases.values(), key=lambda c: int(getattr(c, "n_time", 1)))
+
 
 def infer_time_dim(ds) -> Optional[str]:
     for cand in ("t", "time"):
@@ -138,6 +169,15 @@ def selector_params_only(vars_to_plot: List[str]) -> List[str]:
     """
     geom = {"Spar", "Spol", "Srad", "R", "Z"}
     return [v for v in vars_to_plot if v not in geom]
+
+
+def params_with_requested_geometry(params: List[str]) -> List[str]:
+    """Re-insert R/Z when explicitly requested (e.g. for 2D cut overlays)."""
+    out = selector_params_only(list(params))
+    for geom in ("R", "Z"):
+        if geom in params and geom not in out:
+            out.insert(0, geom)
+    return out
 
 
 def xpoint_idx_bpxy_valley(bp: np.ndarray) -> Optional[int]:
