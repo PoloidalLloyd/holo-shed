@@ -16,3 +16,6 @@ xhermes
 
 # Optional but recommended (sdtools uses it for some features)
 dill
+
+# Dev / CI
+pytest>=7.0
