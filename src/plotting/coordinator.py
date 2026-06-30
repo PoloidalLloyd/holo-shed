@@ -5,6 +5,8 @@ from __future__ import annotations
 from src.plotting import monitor_2d, poloidal_2d, polygon_2d, profiles_1d, radial_2d, time_history
 
 
+# TODO add docs
+
 class PlotCoordinator:
     """Delegates redraw work out of MainWindow."""
 
