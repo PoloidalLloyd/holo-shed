@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from src.ui.qt import QMenu
+from src.ui.qt import QAction, QMenu, QPoint, Qt, qt_checked, qt_unchecked
+
+_qt_checked = qt_checked
+_qt_unchecked = qt_unchecked
 
 class SubplotMenusMixin:
 

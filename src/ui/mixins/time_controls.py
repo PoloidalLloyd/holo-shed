@@ -6,10 +6,60 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from src.dataset_utils import infer_time_dim
 from src.models import LoadedCase
-from src.ui.qt import QKeySequence, QShortcut
+from src.ui.qt import QCheckBox, QKeySequence, QShortcut, Qt
 
 class TimeControlsMixin:
+
+    def _is_case_arrow_keys_enabled(self, label: str) -> bool:
+        return bool(self._case_arrow_keys_enabled.get(label, True))
+
+    def _set_case_arrow_keys_enabled(self, label: str, enabled: bool) -> None:
+        self._case_arrow_keys_enabled[label] = bool(enabled)
+
+    def _ensure_case_arrow_keys_enabled(self, label: str) -> None:
+        if label not in self._case_arrow_keys_enabled:
+            self._case_arrow_keys_enabled[label] = True
+
+    def _sync_main_arrow_keys_checkboxes(self) -> None:
+        labels = list(self.cases.keys())
+        enabled = self._is_case_arrow_keys_enabled(labels[0]) if labels else True
+        for chk in (getattr(self, "_main_arrow_keys_check", None), getattr(self, "_main_arrow_keys_check_2d", None)):
+            if chk is None:
+                continue
+            chk.blockSignals(True)
+            try:
+                chk.setChecked(enabled)
+            finally:
+                chk.blockSignals(False)
+
+    def _wire_arrow_keys_checkboxes(self) -> None:
+        for chk in (getattr(self, "_main_arrow_keys_check", None), getattr(self, "_main_arrow_keys_check_2d", None)):
+            if chk is None:
+                continue
+            chk.toggled.connect(self._on_main_arrow_keys_toggled)
+
+    def _on_main_arrow_keys_toggled(self, checked: bool) -> None:
+        labels = list(self.cases.keys())
+        if not labels:
+            return
+        self._set_case_arrow_keys_enabled(labels[0], checked)
+        self._sync_main_arrow_keys_checkboxes()
+
+    def _make_case_arrow_keys_checkbox(self, label: str) -> "QCheckBox":
+        chk = QCheckBox("keys")
+        chk.setToolTip("When checked, left/right arrow keys adjust this case's time index")
+        chk.setChecked(self._is_case_arrow_keys_enabled(label))
+
+        def on_toggled(checked: bool, case_label: str = label) -> None:
+            self._set_case_arrow_keys_enabled(case_label, checked)
+            labels = list(self.cases.keys())
+            if labels and case_label == labels[0]:
+                self._sync_main_arrow_keys_checkboxes()
+
+        chk.toggled.connect(on_toggled)
+        return chk
 
     def _install_time_shortcuts(self) -> None:
         """
@@ -29,19 +79,27 @@ class TimeControlsMixin:
         add("Shift+Right", int(self._fast_slider_step))
 
     def _nudge_time_slider(self, delta: int) -> None:
-        # Move the main slider
-        slider = self._active_time_slider()
-        try:
-            v = int(slider.value()) + int(delta)
-            v = max(int(slider.minimum()), min(int(slider.maximum()), v))
-            slider.setValue(v)
-            self._set_time_readout_for_index(v)
-        except Exception:
-            pass
+        labels = list(self.cases.keys())
+        first_label = labels[0] if labels else None
+        moved = False
 
-        # Also move all per-case sliders (for synchronized arrow key control)
+        # Move the main slider (first loaded case)
+        if first_label and self._is_case_arrow_keys_enabled(first_label):
+            slider = self._active_time_slider()
+            try:
+                v = int(slider.value()) + int(delta)
+                v = max(int(slider.minimum()), min(int(slider.maximum()), v))
+                slider.setValue(v)
+                self._set_time_readout_for_index(v)
+                moved = True
+            except Exception:
+                pass
+
+        # Also move per-case sliders (for synchronized arrow key control)
         # Handle 1D per-case sliders
         for label, case_slider in self._case_sliders.items():
+            if not self._is_case_arrow_keys_enabled(label):
+                continue
             try:
                 cv = int(case_slider.value()) + int(delta)
                 cv = max(int(case_slider.minimum()), min(int(case_slider.maximum()), cv))
@@ -62,11 +120,14 @@ class TimeControlsMixin:
                     ms_spinbox.blockSignals(True)
                     ms_spinbox.setValue(t_ms)
                     ms_spinbox.blockSignals(False)
+                moved = True
             except Exception:
                 pass
 
         # Handle 2D per-case sliders
         for label, case_slider in self._case_sliders_2d.items():
+            if not self._is_case_arrow_keys_enabled(label):
+                continue
             try:
                 cv = int(case_slider.value()) + int(delta)
                 cv = max(int(case_slider.minimum()), min(int(case_slider.maximum()), cv))
@@ -87,11 +148,12 @@ class TimeControlsMixin:
                     ms_spinbox.blockSignals(True)
                     ms_spinbox.setValue(t_ms)
                     ms_spinbox.blockSignals(False)
+                moved = True
             except Exception:
                 pass
 
         # Trigger single redraw after all sliders updated
-        if self._case_sliders or self._case_sliders_2d:
+        if moved:
             self.request_redraw()
 
     # ---------- UI ----------

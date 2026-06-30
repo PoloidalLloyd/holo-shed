@@ -38,6 +38,7 @@ from src.models import LoadedCase
 from src.paths import ensure_sdtools_on_path
 from src.plotting.coordinator import PlotCoordinator
 from src.ui.qt import (
+    _QT_API,
     QAbstractItemView,
     QApplication,
     QCheckBox,
@@ -136,6 +137,9 @@ class MainWindow(
         self._case_spinboxes_2d: Dict[str, "QSpinBox"] = {}  # per-case index spinbox widgets (2D)
         self._case_ms_spinboxes_2d: Dict[str, "QDoubleSpinBox"] = {}  # per-case time (ms) spinbox widgets (2D)
         self._case_slider_widgets_2d: Dict[str, "QWidget"] = {}  # per-case slider row widgets (2D)
+        self._case_arrow_keys_enabled: Dict[str, bool] = {}  # per-case arrow-key scrubbing
+        self._case_arrow_key_checks: Dict[str, "QCheckBox"] = {}  # per-case row checkboxes (1D)
+        self._case_arrow_key_checks_2d: Dict[str, "QCheckBox"] = {}  # per-case row checkboxes (2D)
         self._normalize_time_enabled: bool = False  # time normalization state
         self.spatial_dim_forced = spatial_dim
         self.state = dict(spatial_dim=None, time_dim=None, vars=[], t_values=None)
@@ -251,6 +255,7 @@ class MainWindow(
 
         # Install shortcuts once widgets exist
         self._install_time_shortcuts()
+        self._wire_arrow_keys_checkboxes()
         # Also install a global key event filter so plain Left/Right always work
         # (Qt can treat bare arrow keys as navigation rather than shortcuts).
         try:

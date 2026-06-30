@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
 from typing import List, Optional, Tuple
 
+import numpy as np
+
+from src.dataset_utils import (
+    infer_spatial_dim,
+    infer_time_dim,
+    list_plottable_vars,
+    list_plottable_vars_2d,
+)
 from src.models import LoadedCase
 
 class DataLoadingMixin:
@@ -181,19 +190,16 @@ class DataLoadingMixin:
             if replace:
                 self.cases.clear()
                 self._case_time_indices.clear()
+                self._case_arrow_keys_enabled.clear()
 
             # Ensure unique label by adding numeric suffix if needed
             unique_label = self._get_unique_case_label(lc.label)
             if unique_label != lc.label:
-                lc = LoadedCase(
-                    label=unique_label,
-                    case_path=lc.case_path,
-                    ds=lc.ds,
-                    n_time=lc.n_time,
-                    is_2d=lc.is_2d,
-                )
+                lc = dataclass_replace(lc, label=unique_label)
             self.cases[lc.label] = lc
+            self._ensure_case_arrow_keys_enabled(lc.label)
             self._update_after_load()
+            self._sync_main_arrow_keys_checkboxes()
             self._update_datasets_list()
             self.set_status("")
             self.request_redraw()

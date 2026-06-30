@@ -12,9 +12,11 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from src.ui.qt import (
+    _QT_API,
+    QAbstractItemView,
     QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget,
-    QVBoxLayout, QWidget, qt_checked, qt_unchecked,
+    QVBoxLayout, QWidget, Qt, qt_checked, qt_unchecked,
 )
 
 class LayoutMixin:
@@ -144,6 +146,13 @@ class LayoutMixin:
         except Exception:
             pass
         time2d_row.addWidget(self.time_ms_spin_2d)
+
+        self._main_arrow_keys_check_2d = QCheckBox("keys")
+        self._main_arrow_keys_check_2d.setToolTip(
+            "When checked, left/right arrow keys adjust this case's time index"
+        )
+        self._main_arrow_keys_check_2d.setChecked(True)
+        time2d_row.addWidget(self._main_arrow_keys_check_2d)
 
         # Keep the old label for backwards compatibility (must be parented to avoid becoming a top-level window)
         self.time_readout_2d = QLabel("time index = 0", self.time2d_widget)
@@ -403,6 +412,13 @@ class LayoutMixin:
         except Exception:
             pass
         slider_row.addWidget(self.time_ms_spin)
+
+        self._main_arrow_keys_check = QCheckBox("keys")
+        self._main_arrow_keys_check.setToolTip(
+            "When checked, left/right arrow keys adjust this case's time index"
+        )
+        self._main_arrow_keys_check.setChecked(True)
+        slider_row.addWidget(self._main_arrow_keys_check)
 
         # Keep old widgets for backwards compatibility (parent + hidden to avoid top-level popup windows)
         self.time_readout = QLabel("time index = 0", prof_plot_tab)

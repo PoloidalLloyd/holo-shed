@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from src.ui.qt import QDoubleSpinBox, QHBoxLayout, QLabel, QSlider, QSpinBox, QVBoxLayout, QWidget
+from src.ui.qt import QDoubleSpinBox, QHBoxLayout, QLabel, QSlider, QSpinBox, QVBoxLayout, QWidget, Qt
 
 class CaseSlidersMixin:
 
@@ -13,6 +13,7 @@ class CaseSlidersMixin:
         # Update both 1D and 2D sliders
         self._update_case_sliders_1d()
         self._update_case_sliders_2d()
+        self._sync_main_arrow_keys_checkboxes()
 
     def _update_case_sliders_1d(self) -> None:
         """Create/update per-case time sliders for 1D mode."""
@@ -31,6 +32,11 @@ class CaseSlidersMixin:
                 self._case_spinboxes.pop(label, None)
                 self._case_ms_spinboxes.pop(label, None)
                 self._case_time_indices.pop(label, None)
+                chk = self._case_arrow_key_checks.pop(label, None)
+                if chk is not None:
+                    chk.setParent(None)
+                    chk.deleteLater()
+                self._case_arrow_keys_enabled.pop(label, None)
 
         # Only show per-case sliders when multiple 1D datasets are loaded
         show_sliders = len(self.cases) > 1 and not self._mode_is_2d
@@ -77,6 +83,11 @@ class CaseSlidersMixin:
                     ms_spin.blockSignals(True)
                     ms_spin.setValue(t_ms)
                     ms_spin.blockSignals(False)
+                chk = self._case_arrow_key_checks.get(label)
+                if chk is not None:
+                    chk.blockSignals(True)
+                    chk.setChecked(self._is_case_arrow_keys_enabled(label))
+                    chk.blockSignals(False)
             else:
                 # Create new slider row
                 row_widget = QWidget()
@@ -132,6 +143,9 @@ class CaseSlidersMixin:
                     pass
                 row_layout.addWidget(ms_spin)
 
+                keys_chk = self._make_case_arrow_keys_checkbox(label)
+                row_layout.addWidget(keys_chk)
+
                 # Connect signals
                 def make_slider_handler(case_label, spinbox, ms_spinbox, case_obj):
                     def handler(v):
@@ -182,6 +196,7 @@ class CaseSlidersMixin:
                 self._case_sliders[label] = slider
                 self._case_spinboxes[label] = spin
                 self._case_ms_spinboxes[label] = ms_spin
+                self._case_arrow_key_checks[label] = keys_chk
                 self._case_slider_widgets[label] = row_widget
                 self._case_sliders_layout.addWidget(row_widget)
 
@@ -202,6 +217,11 @@ class CaseSlidersMixin:
                 self._case_spinboxes_2d.pop(label, None)
                 self._case_ms_spinboxes_2d.pop(label, None)
                 self._case_time_indices_2d.pop(label, None)
+                chk = self._case_arrow_key_checks_2d.pop(label, None)
+                if chk is not None:
+                    chk.setParent(None)
+                    chk.deleteLater()
+                self._case_arrow_keys_enabled.pop(label, None)
 
         # Only show per-case sliders when multiple 2D datasets are loaded
         show_sliders = len(self.cases) > 1 and self._mode_is_2d
@@ -248,6 +268,11 @@ class CaseSlidersMixin:
                     ms_spin.blockSignals(True)
                     ms_spin.setValue(t_ms)
                     ms_spin.blockSignals(False)
+                chk = self._case_arrow_key_checks_2d.get(label)
+                if chk is not None:
+                    chk.blockSignals(True)
+                    chk.setChecked(self._is_case_arrow_keys_enabled(label))
+                    chk.blockSignals(False)
             else:
                 # Create new slider row
                 row_widget = QWidget()
@@ -303,6 +328,9 @@ class CaseSlidersMixin:
                     pass
                 row_layout.addWidget(ms_spin)
 
+                keys_chk = self._make_case_arrow_keys_checkbox(label)
+                row_layout.addWidget(keys_chk)
+
                 # Connect signals (use 2D-specific dicts)
                 def make_slider_handler_2d(case_label, spinbox, ms_spinbox, case_obj):
                     def handler(v):
@@ -353,6 +381,7 @@ class CaseSlidersMixin:
                 self._case_sliders_2d[label] = slider
                 self._case_spinboxes_2d[label] = spin
                 self._case_ms_spinboxes_2d[label] = ms_spin
+                self._case_arrow_key_checks_2d[label] = keys_chk
                 self._case_slider_widgets_2d[label] = row_widget
                 self._case_sliders_layout_2d.addWidget(row_widget)
 
