@@ -315,6 +315,8 @@ def redraw_poloidal(win):
                     plot_label = f"{name} ({c.label})" if len(win.cases) > 1 else name
                 else:
                     plot_label = c.label
+                if not getattr(c, "is_2d", False):
+                    plot_label = f"{plot_label} (1D)"
 
                 if datasets_by_colour:
                     # Datasets by colour: primary var solid, let matplotlib pick color

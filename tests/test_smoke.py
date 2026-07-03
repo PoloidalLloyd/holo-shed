@@ -28,6 +28,16 @@ def test_import_src_package():
     from src.plotting import common, coordinator, ylim
 
 
+def test_vendored_xhermes_on_path():
+    from src.paths import ensure_vendored_deps_on_path
+
+    ensure_vendored_deps_on_path()
+    import xhermes  # noqa: F401
+
+    repo_root = Path(__file__).resolve().parents[1]
+    assert (repo_root / "external" / "xhermes" / "xhermes" / "__init__.py").is_file()
+
+
 @qt_required
 def test_import_app_requires_qt():
     from src import app  # noqa: F401
@@ -114,6 +124,49 @@ def test_merge_case_variable_sets_intersection():
     assert merge_case_variable_sets([a, b], mixed_backends=True) == ["Ne", "Te"]
 
 
+def test_session_has_2d_case():
+    from src.dataset_utils import cases_have_mixed_dimensions, session_has_2d_case
+    from src.models import LoadedCase
+
+    c1 = LoadedCase(label="a", case_path="/a", ds=None, is_2d=False, backend_kind="hermes")
+    c2 = LoadedCase(label="b", case_path="/b", ds=None, is_2d=True, backend_kind="hermes")
+    cases = {"a": c1, "b": c2}
+    assert session_has_2d_case(cases)
+    assert cases_have_mixed_dimensions(cases)
+    assert not session_has_2d_case({"a": c1})
+
+
+def test_hermes_1d_poloidal_dataframe():
+    import xarray as xr
+    from src.backends.hermes import HermesBackend
+    from src.models import LoadedCase
+
+    ds = xr.Dataset(
+        {"Te": (("t", "pos"), np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))},
+        coords={
+            "t": [0.0, 1.0],
+            "pos": [0.0, 0.5, 1.0],
+            "Spar": ("pos", [0.0, 1.0, 2.0]),
+        },
+    )
+    case = LoadedCase(
+        label="1d",
+        case_path="/1d",
+        ds=ds,
+        n_time=2,
+        is_2d=False,
+        backend_kind="hermes",
+        backend=HermesBackend(),
+    )
+    df = case.backend.get_poloidal_profile(
+        case, region="outer_lower", sepadd=0, time_index=0, params=["Te"]
+    )
+    assert "Te" in df.columns
+    assert "Spar" in df.columns
+    assert len(df) == 3
+    assert float(df["Te"].iloc[0]) == 1.0
+
+
 def test_format_case_display_label():
     from src.dataset_utils import format_case_display_label
     from src.models import LoadedCase
@@ -177,3 +230,62 @@ def test_entry_point_shim():
     text = path.read_text()
     assert "src.app" in text
     assert "main()" in text
+
+
+def test_solps_transient_detection(tmp_path: Path):
+    """Copy a real balance.nc and add synthetic b2time.nc for transient metadata."""
+    import os
+    import shutil
+
+    import netCDF4 as nc
+
+    from src.backends.solps import SolpsBackend
+
+    fixture = os.environ.get(
+        "HOLO_SHED_SOLPS_FIXTURE",
+        "/Users/lloyd/Documents/solps/puff=13.0e21_pump=0.001_divchiconstfix_bcmom2_visper1_rxf0p1_parmvsa2_redoutpfrtrans_pufflfs_pin1.0",
+    )
+    balance_src = Path(fixture) / "balance.nc"
+    if not balance_src.is_file():
+        pytest.skip("SOLPS balance.nc fixture not available")
+
+    shutil.copy(balance_src, tmp_path / "balance.nc")
+
+    with nc.Dataset(tmp_path / "balance.nc") as bal:
+        ny, nx = bal.variables["te"].shape
+    ntime = 3
+
+    with nc.Dataset(tmp_path / "b2time.nc", "w") as ds:
+        ds.createDimension("time", ntime)
+        ds.createDimension("y", ny)
+        ds.createDimension("x", nx)
+        timesa = ds.createVariable("timesa", "f8", ("time",))
+        timesa[:] = [0.0, 0.05, 0.1]
+        te2d = ds.createVariable("te2d", "f8", ("time", "y", "x"))
+        base = np.linspace(1.0, 3.0, ny * nx).reshape(ny, nx)
+        for i in range(ntime):
+            te2d[i, :, :] = base * (i + 1)
+        ne2d = ds.createVariable("ne2d", "f8", ("time", "y", "x"))
+        ne2d[:] = 1e19
+        ti2d = ds.createVariable("ti2d", "f8", ("time", "y", "x"))
+        ti2d[:] = 10.0
+
+    backend = SolpsBackend()
+    case = backend.load(tmp_path)
+    assert case.n_time == ntime
+    name, times = backend.time_coordinate(case)
+    assert name == "timesa"
+    assert len(times) == ntime
+
+    slc = case.ds
+    final_te = slc.get_field("Te", itime=-1)
+    early_te = slc.get_field("Te", itime=0)
+    assert final_te.shape == early_te.shape
+    assert not np.allclose(final_te, early_te)
+
+    df = backend.get_poloidal_profile(
+        case, region="outer_lower", sepadd=0, time_index=1, params=["Te"]
+    )
+    assert "time" in df.columns
+
+    slc.close()

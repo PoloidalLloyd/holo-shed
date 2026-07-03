@@ -35,7 +35,7 @@ from src.dataset_utils import (
     xpoint_idx_bpxy_valley,
 )
 from src.models import LoadedCase
-from src.paths import ensure_sdtools_on_path
+from src.paths import ensure_vendored_deps_on_path
 from src.plotting.coordinator import PlotCoordinator
 from src.ui.qt import (
     _QT_API,
@@ -95,7 +95,7 @@ class MainWindow(
     def __init__(self, *, initial_case_path: Optional[str], spatial_dim: Optional[str]):
         super().__init__()
 
-        ensure_sdtools_on_path()
+        ensure_vendored_deps_on_path()
         try:
             from hermes3.load import Load  # type: ignore
         except Exception as e:

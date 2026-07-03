@@ -9,11 +9,13 @@ import numpy as np
 
 from src.dataset_utils import (
     cases_have_mixed_backends,
+    cases_have_mixed_dimensions,
     infer_spatial_dim,
     infer_time_dim,
     list_plottable_vars,
     list_plottable_vars_2d,
     merge_case_variable_sets,
+    session_has_2d_case,
     time_reference_case,
 )
 from src.models import LoadedCase
@@ -31,8 +33,9 @@ class DataLoadingMixin:
 
         case_list = list(self.cases.values())
         first_case = case_list[0]
-        mixed = cases_have_mixed_backends(self.cases)
-        is_2d = bool(getattr(first_case, "is_2d", False))
+        mixed_backends = cases_have_mixed_backends(self.cases)
+        mixed_dims = cases_have_mixed_dimensions(self.cases)
+        use_2d_mode = session_has_2d_case(self.cases)
         var_sets: List[set[str]] = []
         tdim: Optional[str] = None
 
@@ -43,7 +46,7 @@ class DataLoadingMixin:
             else:
                 ds = c.ds
                 tdim_c = infer_time_dim(ds)
-                if is_2d:
+                if getattr(c, "is_2d", False):
                     var_sets.append(set(list_plottable_vars_2d(ds, time_dim=tdim_c)))
                 else:
                     sdim_c = self.spatial_dim_forced or infer_spatial_dim(ds)
@@ -57,8 +60,14 @@ class DataLoadingMixin:
         else:
             tdim = None
 
-        all_vars = merge_case_variable_sets(var_sets, mixed_backends=mixed)
-        sdim = "theta" if is_2d else (self.spatial_dim_forced or infer_spatial_dim(first_case.ds))
+        all_vars = merge_case_variable_sets(
+            var_sets, mixed_backends=(mixed_backends or mixed_dims)
+        )
+        sdim = (
+            "theta"
+            if use_2d_mode
+            else (self.spatial_dim_forced or infer_spatial_dim(first_case.ds))
+        )
         return all_vars, sdim, tdim
 
     def _set_time_range(self, n_t: int) -> None:
@@ -116,14 +125,10 @@ class DataLoadingMixin:
         self.state["spatial_dim"] = sdim
         self.state["time_dim"] = tdim
 
-        # Switch UI mode to match data dimensionality
-        first_case = next(iter(self.cases.values()), None)
-        try:
-            is_2d = bool(getattr(first_case, "is_2d", False)) if first_case is not None else False
-        except Exception:
-            is_2d = False
-        if bool(is_2d) != bool(self._mode_is_2d):
-            self._configure_tabs(is_2d=bool(is_2d))
+        # Switch UI mode: 2D layout when any case is 2D (allows Hermes 1D overlay on poloidal tab).
+        use_2d_mode = session_has_2d_case(self.cases)
+        if bool(use_2d_mode) != bool(self._mode_is_2d):
+            self._configure_tabs(is_2d=bool(use_2d_mode))
 
         # Drop selections that no longer exist
         if vars_:
@@ -141,6 +146,7 @@ class DataLoadingMixin:
             self._selected_set = set()
 
         # Time axis for readouts: use the longest transient case, not load order.
+        first_case = next(iter(self.cases.values()), None)
         ref_case = time_reference_case(self.cases) or first_case
         t_values = None
         if ref_case is not None and ref_case.backend is not None:
@@ -245,19 +251,14 @@ class DataLoadingMixin:
         try:
             lc = self._load_case(p)
 
-            # Prevent mixing 1D and 2D cases in one session (UI/plotting differs).
             if self.cases and (not replace):
-                existing_is_2d = bool(next(iter(self.cases.values())).is_2d)
-                if bool(lc.is_2d) != bool(existing_is_2d):
-                    raise ValueError(
-                        "Cannot mix 1D and 2D cases in the same session. "
-                        "Use 'New session' to switch modes."
-                    )
-
-            # Limit 2D mode to 3 cases for comparison (keeps plots readable)
-            if self.cases and (not replace) and bool(next(iter(self.cases.values())).is_2d):
-                if len(self.cases) >= 3:
-                    raise ValueError("2D mode supports up to 3 datasets for comparison. Use 'New session' to start fresh.")
+                # Up to 3 cases when any 2D case is in the session (comparison mode).
+                if session_has_2d_case(self.cases) or bool(lc.is_2d):
+                    if len(self.cases) >= 3:
+                        raise ValueError(
+                            "Comparison mode supports up to 3 datasets. "
+                            "Use 'New session' to start fresh."
+                        )
 
             if replace:
                 self.cases.clear()
@@ -277,6 +278,11 @@ class DataLoadingMixin:
                 self.set_status(
                     "Mixed Hermes + SOLPS session: no common plottable variables found.",
                     is_error=True,
+                )
+            elif cases_have_mixed_dimensions(self.cases):
+                self.set_status(
+                    "Mixed 1D + 2D: Hermes 1D appears on Poloidal tab only (uses Spar/pos).",
+                    is_error=False,
                 )
             else:
                 self.set_status("")

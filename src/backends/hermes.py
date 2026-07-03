@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from src.dataset_utils import (
@@ -21,14 +22,14 @@ from src.dataset_utils import (
     should_use_squash_for_load,
 )
 from src.models import LoadedCase
-from src.paths import ensure_sdtools_on_path
+from src.paths import ensure_vendored_deps_on_path
 
 
 class HermesBackend:
     kind = "hermes"
 
     def __init__(self) -> None:
-        ensure_sdtools_on_path()
+        ensure_vendored_deps_on_path()
         from hermes3.load import Load  # type: ignore
 
         self._Load = Load
@@ -154,9 +155,62 @@ class HermesBackend:
             return ds.isel({tdim: int(time_index)})
         return ds
 
+    def _hermes_1d_poloidal_dataframe(
+        self, case: LoadedCase, *, time_index: int, params: list
+    ) -> pd.DataFrame:
+        """Build a poloidal-style profile from a Hermes 1D dataset (single flux tube)."""
+        ds = self.ds_at_time_index(case, time_index)
+        sdim = infer_spatial_dim(ds)
+        tdim = infer_time_dim(case.ds)
+
+        def _values(name: str) -> Optional[np.ndarray]:
+            if name in ds.coords:
+                arr = np.asarray(ds.coords[name].values)
+            elif name in ds:
+                da = ds[name]
+                if tdim and tdim in da.dims:
+                    da = da.isel({tdim: int(time_index)})
+                arr = np.asarray(da.values)
+            else:
+                return None
+            return np.asarray(arr, dtype=float).ravel()
+
+        n = int(ds.sizes.get(sdim, 0)) if sdim in ds.dims else 0
+        df = pd.DataFrame()
+        for coord in ("Spar", "Spol", "pos", "R", "Z"):
+            vals = _values(coord)
+            if vals is not None and vals.size:
+                if n and vals.size != n:
+                    continue
+                df[coord] = vals
+
+        if "Spar" not in df.columns:
+            if "Spol" in df.columns:
+                df["Spar"] = df["Spol"].values
+            elif "pos" in df.columns:
+                df["Spar"] = df["pos"].values
+            elif n:
+                df["Spar"] = np.arange(n, dtype=float)
+
+        for name in selector_params_only(list(params)):
+            vals = _values(name)
+            if vals is not None and vals.size:
+                if n and vals.size != n:
+                    continue
+                df[name] = vals
+
+        if df.empty:
+            raise ValueError("No profile data extracted from Hermes 1D case")
+        return df
+
     def get_poloidal_profile(
         self, case: LoadedCase, *, region: str, sepadd: int, time_index: int, params: list
     ) -> pd.DataFrame:
+        if not case.is_2d:
+            return self._hermes_1d_poloidal_dataframe(
+                case, time_index=int(time_index), params=list(params)
+            )
+
         from hermes3.selectors import get_1d_poloidal_data  # type: ignore
 
         ds_t = self.ds_at_time_index(case, time_index)
@@ -176,6 +230,9 @@ class HermesBackend:
     def get_radial_profile(
         self, case: LoadedCase, *, region: str, time_index: int, params: list
     ) -> pd.DataFrame:
+        if not case.is_2d:
+            raise RuntimeError("Radial profiles require a 2D Hermes case")
+
         import hermes3.selectors as sel  # type: ignore
 
         try:

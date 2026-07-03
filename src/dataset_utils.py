@@ -32,6 +32,24 @@ def cases_have_mixed_backends(cases) -> bool:
     return len(kinds) > 1
 
 
+def cases_have_mixed_dimensions(cases) -> bool:
+    dims = {bool(getattr(c, "is_2d", False)) for c in cases.values()}
+    return len(dims) > 1
+
+
+def session_has_2d_case(cases) -> bool:
+    """True when any loaded case supports 2D extraction tabs (Hermes 2D or SOLPS)."""
+    return any(bool(getattr(c, "is_2d", False)) for c in cases.values())
+
+
+def case_supports_radial_extract(case) -> bool:
+    return bool(getattr(case, "is_2d", False))
+
+
+def case_supports_2d_field(case) -> bool:
+    return bool(getattr(case, "is_2d", False))
+
+
 def time_reference_case(cases) -> Optional[object]:
     """Case with the longest time axis — used for session readouts (order-independent)."""
     if not cases:

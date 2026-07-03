@@ -165,7 +165,10 @@ def redraw_polygon(win):
             win.poly_figure.clear()
             ax = win.poly_figure.add_subplot(1, 1, 1)
             ax.set_axis_off()
-            ax.text(0.5, 0.5, "No 2D dataset loaded.", ha="center", va="center", transform=ax.transAxes)
+            msg = "No 2D dataset loaded."
+            if win.cases:
+                msg = "No 2D cases for field plots.\n(Hermes 1D appears on Poloidal tab only.)"
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
             win.poly_canvas.draw_idle()
             return
 

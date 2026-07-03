@@ -10,7 +10,7 @@ import pandas as pd
 
 from src.dataset_utils import format_case_label, selector_params_only, params_with_requested_geometry
 from src.models import LoadedCase
-from src.paths import ensure_sdtools_on_path
+from src.paths import ensure_vendored_deps_on_path
 
 # Variables that are useful in holo-shed but not 2D grid fields — hide from pickers.
 _SKIP_VAR_PREFIXES = ("left", "right", "species", "jsep", "bb", "crx", "cry", "gs", "conn")
@@ -39,7 +39,7 @@ _SKIP_VAR_NAMES = {
 
 
 def _import_solps_case():
-    ensure_sdtools_on_path()
+    ensure_vendored_deps_on_path()
     try:
         from code_comparison.solps_pp import SOLPScase  # type: ignore
     except ImportError as e:
@@ -56,6 +56,16 @@ def _slc(case: LoadedCase):
     if case.ds is None:
         raise RuntimeError(f"Case {case.label} has no SOLPS data loaded")
     return case.ds
+
+
+def _is_transient(slc: Any) -> bool:
+    return bool(getattr(slc, "transient", False))
+
+
+def _time_kwargs(slc: Any, time_index: int) -> dict:
+    if _is_transient(slc):
+        return {"itime": int(time_index)}
+    return {}
 
 
 def _is_plottable_2d(name: str, arr: Any) -> bool:
@@ -75,13 +85,19 @@ def _is_plottable_2d(name: str, arr: Any) -> bool:
 
 
 def _resolve_param(slc: Any, param: str) -> str:
-    """Map holo-shed variable name to a balance-file key."""
+    """Map holo-shed variable name to a balance-file or b2time key."""
     if param in slc.bal:
         return param
     lower = param.lower()
     if lower in slc.bal:
         return lower
-    raise KeyError(f"Parameter {param!r} not found in SOLPS balance data")
+    if hasattr(slc, "get_field"):
+        try:
+            slc.get_field(param, itime=-1)
+            return param
+        except Exception:
+            pass
+    raise KeyError(f"Parameter {param!r} not found in SOLPS data")
 
 
 class SolpsBackend:
@@ -114,7 +130,8 @@ class SolpsBackend:
         )
 
     def _detect_n_time(self, slc: Any) -> int:
-        """Steady-state balance files have a single time slice; extend when transient support lands."""
+        if _is_transient(slc):
+            return max(1, int(getattr(slc, "ntime", 1)))
         return 1
 
     def list_variables(self, case: LoadedCase) -> List[str]:
@@ -151,20 +168,30 @@ class SolpsBackend:
         def add(name: str) -> None:
             if name in seen:
                 return
-            arr = slc.bal.get(name)
-            if arr is not None and _is_plottable_2d(name, arr):
-                out.append(name)
-                seen.add(name)
+            try:
+                if hasattr(slc, "get_field"):
+                    arr = slc.get_field(name, itime=-1)
+                else:
+                    arr = slc.bal.get(name)
+                if arr is not None and _is_plottable_2d(name, arr):
+                    out.append(name)
+                    seen.add(name)
+            except Exception:
+                pass
 
         for name in preferred:
-            if name in slc.bal:
-                add(name)
-        for name in sorted(slc.bal.keys()):
+            add(name)
+        param_names = getattr(slc, "params", None) or sorted(slc.bal.keys())
+        for name in sorted(param_names):
             add(name)
         return out
 
     def time_coordinate(self, case: LoadedCase) -> Tuple[str, np.ndarray]:
         slc = _slc(case)
+        if _is_transient(slc) and getattr(slc, "times", None) is not None:
+            vals = np.asarray(slc.times, dtype=float).ravel()
+            if vals.size:
+                return "timesa", vals
         for key in ("times", "time", "t"):
             if key in slc.bal:
                 try:
@@ -177,7 +204,6 @@ class SolpsBackend:
         return "t", np.arange(n, dtype=float)
 
     def ds_at_time_index(self, case: LoadedCase, time_index: int) -> Any:
-        # Steady-state: return the live SOLPScase object (time index ignored for now).
         return _slc(case)
 
     def get_poloidal_profile(
@@ -198,6 +224,7 @@ class SolpsBackend:
             sepadd=int(sepadd),
             target_first=False,
             guards=False,
+            **_time_kwargs(slc, time_index),
         )
 
     def get_radial_profile(
@@ -220,6 +247,7 @@ class SolpsBackend:
             region=str(region),
             guards=False,
             keep_geometry=keep_geometry,
+            **_time_kwargs(slc, time_index),
         )
         if keep_geometry and "R" in df.columns and "Z" not in df.columns and str(region) in ("omp", "imp"):
             df = df.copy()
@@ -238,7 +266,6 @@ class SolpsBackend:
         slc = _slc(case)
         grid_only = bool(plot_kw.get("grid_only", False))
         if grid_only:
-            # plot_2d only uses param for array shape before replacing with zeros.
             shape_key = "te" if "te" in slc.bal else "Te" if "Te" in slc.bal else str(param)
             if shape_key not in slc.bal:
                 shape_key = _resolve_param(slc, str(param))
@@ -255,6 +282,7 @@ class SolpsBackend:
             cbar=bool(plot_kw.get("cbar", False)),
             separatrix=False if grid_only else bool(plot_kw.get("separatrix", True)),
             antialias=bool(plot_kw.get("antialias", True)),
+            **_time_kwargs(slc, time_index),
         )
         if grid_only:
             kwargs.update(linecolor="k", linewidth=0.2)

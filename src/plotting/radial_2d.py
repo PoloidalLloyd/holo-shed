@@ -73,6 +73,18 @@ def redraw_radial(win):
 
         region = str(win.rad_region_combo.currentText() or "omp")
 
+        cases_rad = [c for c in win.cases.values() if getattr(c, "is_2d", False)]
+        if not cases_rad:
+            win._clear_overlay_buttons_rad()
+            ax = win.rad_figure.add_subplot(1, 1, 1)
+            ax.set_axis_off()
+            msg = "No 2D cases for radial profiles."
+            if win.cases:
+                msg += "\n(Hermes 1D cases appear on the Poloidal tab only.)"
+            ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes)
+            win.rad_canvas.draw_idle()
+            return
+
         n = len(vars_to_plot)
         nrows = min(3, n)
         ncols = int(np.ceil(n / nrows))
@@ -121,7 +133,7 @@ def redraw_radial(win):
                 if vname not in var_colors:
                     var_colors[vname] = color_cycle[len(var_colors) % len(color_cycle)]
 
-        for case_idx, c in enumerate(win.cases.values()):
+        for case_idx, c in enumerate(cases_rad):
             ds_t = win._ds_at_time(c)
             ti = win._get_time_index_for_case(c)
             # Incremental cache: keep one df per (case,time,region) and extend
