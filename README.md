@@ -50,26 +50,9 @@ holo-shed/                  # git repo (project name)
   tests/
     test_smoke.py
 ```
+## Usage with SOLPS-ITER
 
-## Adding a backend
-
-1. Implement `CaseBackend` in `src/backends/base.py` (see `HermesBackend` for reference).
-2. Register detection in `src/backends/factory.py` (`detect_backend` + `get_backend`).
-3. Plotting modules call `case.backend.get_poloidal_profile(...)` via `src/plotting/common.py` — no redraw changes needed if the backend returns the same DataFrame columns.
-
-SOLPS cases are detected when a directory contains `balance.nc` (and no BOUT dump files). Load with the same `python3 holo-shed.py /path/to/solps/run` command. Steady-state `balance.nc` and transient cases with `b2time.nc` are supported; use the time slider to step through transient SOLPS slices (`timesa` in seconds). Balance-only quantities (e.g. `Vd+`, `M`, EIRENE `*_bal` terms) remain tied to the final snapshot in `balance.nc`.
-
-**Hermes + SOLPS comparison:** use **Load case** for each directory in any order. Variables are intersected when backends or dimensions are mixed (e.g. `Te`, `Ne`). Poloidal/radial tabs overlay profiles; the 2D field tab shows side-by-side plots (up to 3 cases). **New session** clears and opens a single case.
-
-**Hermes 1D + 2D (or SOLPS):** load a 2D case first (or any 2D case in the session). Hermes 1D cases can then be added and appear on the **Poloidal 1D** tab only (plotted vs `Spar`/`pos`). Radial and 2D field tabs show 2D cases only. Up to 3 datasets total in comparison mode.
-
-## Tests
-
-```bash
-python3 -m pytest tests/
-```
-
-Smoke tests cover imports, backend detection, and pure helpers without opening a display.
+SOLPS cases are detected when a directory contains `balance.nc` (and no BOUT dump files). Load with the same `python3 holo-shed.py /path/to/solps/run` command. Steady-state `balance.nc` and transient cases with `b2time.nc` are supported. Balance-only quantities (e.g. `Vd+`, `M`, EIRENE `*_bal` terms) remain tied to the final snapshot in `balance.nc`.
 
 ## Notes
 
