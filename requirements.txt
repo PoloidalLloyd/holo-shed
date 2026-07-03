@@ -12,7 +12,8 @@ PySide6
 boutdata
 boututils
 xbout
-xhermes
+# xhermes: vendored under external/xhermes (submodule). Pip install is a fallback.
+xhermes==0.1.0
 
 # Optional but recommended (sdtools uses it for some features)
 dill

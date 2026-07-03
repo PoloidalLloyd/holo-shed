@@ -1,3 +1,6 @@
 [submodule "external/sdtools"]
 	path = external/sdtools
 	url = https://github.com/mikekryjak/sdtools
+[submodule "external/xhermes"]
+	path = external/xhermes
+	url = https://github.com/boutproject/xhermes.git
