@@ -1,6 +1,6 @@
 # holo-shed
 
-A Qt GUI for rapid Hermes-3 and SOLPS 2D analysis via a pluggable backend layer.
+A Qt GUI for rapid Hermes-3 and SOLPS 2D analysis.
 
 ## Install
 
@@ -31,8 +31,6 @@ python3 -m pip install -r requirements.txt
 python3 holo-shed.py /path/to/case_dir
 ```
 
-The entry script is a thin shim; application code is the `src` Python package in this repo.
-
 ## Package layout
 
 ```
@@ -57,4 +55,3 @@ SOLPS cases are detected when a directory contains `balance.nc` (and no BOUT dum
 ## Notes
 
 - Automatic dimension detection supports both 1D and 2D Hermes cases; 2D analysis requires the grid file in the case directory.
-- The 2D monitor tab is basic and may be extended later.
