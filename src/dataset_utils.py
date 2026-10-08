@@ -377,6 +377,18 @@ def should_use_squash_for_load(case_dir: Path) -> bool:
     return False
 
 
+def is_squash_only_directory(case_dir: Path) -> bool:
+    """Check if directory has only a squash file (no BOUT.dmp files or BOUT.inp).
+
+    This is used to detect cases where we need to bypass sdtools and load
+    directly via xhermes, since sdtools assumes BOUT.dmp files exist.
+    """
+    has_squash = (case_dir / "BOUT.squash.nc").exists()
+    has_inp = (case_dir / "BOUT.inp").exists()
+    has_dmp = any(case_dir.glob("BOUT.dmp.*.nc"))
+    return has_squash and not has_inp and not has_dmp
+
+
 def probe_is_2d_case(case_dir: Path) -> bool:
     probe_path = pick_bout_output_for_probe(case_dir)
     try:
