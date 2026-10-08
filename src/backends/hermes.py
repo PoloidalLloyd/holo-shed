@@ -74,20 +74,14 @@ class HermesBackend:
             return cs2
 
         def _load_1d():
-            # For squash-only directories, bypass sdtools and load directly via xhermes
-            # since sdtools assumes BOUT.dmp files and BOUT.inp exist
+            # For squash-only directories, bypass sdtools AND xbout and load directly
+            # via xarray since neither xbout nor sdtools can handle squash files
+            # without the accompanying dump files
             if is_squash_only_directory(case_dir):
-                import xhermes
+                import xarray as xr
 
                 squash_path = str(case_dir / "BOUT.squash.nc")
-                ds = xhermes.open_hermesdataset(
-                    datapath=squash_path,
-                    inputfilepath=None,
-                    info=False,
-                    keep_yboundaries=True,
-                    cache=False,
-                    unnormalise=True,
-                )
+                ds = xr.open_dataset(squash_path)
                 ds = ds.squeeze(drop=True)
                 # Return a minimal Case-like object with ds attribute
                 from types import SimpleNamespace

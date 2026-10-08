@@ -17,6 +17,7 @@ xhermes==0.1.0
 
 # Optional but recommended (sdtools uses it for some features)
 dill
+ipywidgets
 
 # Dev / CI
 pytest>=7.0
