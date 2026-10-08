@@ -123,6 +123,10 @@ def redraw_radial(win):
         linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
         datasets_by_colour = win._datasets_by_colour()
 
+        # Check if markers should be shown
+        show_markers = win.show_markers_check.isChecked() if hasattr(win, 'show_markers_check') else False
+        marker_style = 'o' if show_markers else None
+
         # Build variable-to-color map for linestyle mode (same variable = same color across datasets)
         var_colors: Dict[str, str] = {}
         if not datasets_by_colour:
@@ -248,14 +252,14 @@ def redraw_radial(win):
 
                 if datasets_by_colour:
                     # Datasets by colour: primary var solid, let matplotlib pick color
-                    line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0])
+                    line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0], marker=marker_style, markersize=4)
                     case_color = line.get_color()
                     case_ls = linestyles[0]
                 else:
                     # Datasets by linestyle: each dataset gets different linestyle, same color per variable
                     case_ls = linestyles[case_idx % len(linestyles)]
                     var_color = var_colors.get(name)
-                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls, color=var_color)
+                    line, = ax.plot(x, y, label=plot_label, linestyle=case_ls, color=var_color, marker=marker_style, markersize=4)
                     case_color = line.get_color()
 
                 # Plot overlay variables
@@ -288,11 +292,11 @@ def redraw_radial(win):
                         if datasets_by_colour:
                             # Overlays use different linestyle, same color per case
                             ls = linestyles[(ov_idx + 1) % len(linestyles)]
-                            ax.plot(x, ov_y, label=ov_label, linestyle=ls, color=case_color)
+                            ax.plot(x, ov_y, label=ov_label, linestyle=ls, color=case_color, marker=marker_style, markersize=4)
                         else:
                             # Overlays use same color per variable, different linestyle per case
                             ov_color = var_colors.get(ov_name)
-                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls, color=ov_color)
+                            ax.plot(x, ov_y, label=ov_label, linestyle=case_ls, color=ov_color, marker=marker_style, markersize=4)
                     except Exception:
                         pass
 

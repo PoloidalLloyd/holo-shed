@@ -192,6 +192,10 @@ def redraw_profiles(win):
             linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
             datasets_by_colour = win._datasets_by_colour()
 
+            # Check if markers should be shown
+            show_markers = win.show_markers_check.isChecked() if hasattr(win, 'show_markers_check') else False
+            marker_style = 'o' if show_markers else None
+
             # Build variable-to-color map for linestyle mode (same variable = same color across datasets)
             var_colors: Dict[str, str] = {}
             if not datasets_by_colour:
@@ -237,13 +241,13 @@ def redraw_profiles(win):
 
                     if datasets_by_colour:
                         # Datasets by colour: primary var solid, let matplotlib pick color
-                        line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0])
+                        line, = ax.plot(x, y, label=plot_label, linestyle=linestyles[0], marker=marker_style, markersize=4)
                         case_colors[c.label] = line.get_color()
                     else:
                         # Datasets by linestyle: each dataset gets different linestyle, same color per variable
                         ls = linestyles[case_idx % len(linestyles)]
                         var_color = var_colors.get(name)
-                        line, = ax.plot(x, y, label=plot_label, linestyle=ls, color=var_color)
+                        line, = ax.plot(x, y, label=plot_label, linestyle=ls, color=var_color, marker=marker_style, markersize=4)
                         case_colors[c.label] = (line.get_color(), ls)
                 except Exception as e:
                     win.set_status(f"Plot error for {name}: {e}", is_error=True)
@@ -280,13 +284,13 @@ def redraw_profiles(win):
                             # Datasets by colour: overlays use different linestyle, same color per case
                             ls = linestyles[(ov_idx + 1) % len(linestyles)]
                             color = case_colors.get(c.label)
-                            ax.plot(x, y, label=ov_label, linestyle=ls, color=color)
+                            ax.plot(x, y, label=ov_label, linestyle=ls, color=color, marker=marker_style, markersize=4)
                         else:
                             # Datasets by linestyle: overlays use same color per variable, different linestyle per case
                             stored = case_colors.get(c.label)
                             ls = stored[1] if stored else linestyles[case_idx % len(linestyles)]
                             ov_color = var_colors.get(ov_name)
-                            ax.plot(x, y, label=ov_label, linestyle=ls, color=ov_color)
+                            ax.plot(x, y, label=ov_label, linestyle=ls, color=ov_color, marker=marker_style, markersize=4)
                     except Exception as e:
                         win.set_status(f"Overlay plot error for {ov_name}: {e}", is_error=True)
 

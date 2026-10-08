@@ -289,3 +289,61 @@ def test_solps_transient_detection(tmp_path: Path):
     assert "time" in df.columns
 
     slc.close()
+
+
+def test_solps_list_variables_uses_balance_when_get_field_fails():
+    """b2time without te2d must still list Te/Ne from balance.nc."""
+    import numpy as np
+
+    from src.backends.solps import SolpsBackend, _b2time_has_plasma_2d
+    from src.models import LoadedCase
+
+    class _EmptyB2:
+        variables = {"tesepm": None, "ne3dl": None}
+
+    class FakeSlc:
+        transient = True
+        _b2time = _EmptyB2()
+        bal = {
+            "Te": np.ones((8, 8)),
+            "Ne": np.ones((8, 8)),
+            "hx": np.ones((8, 8)),
+        }
+        g = {}
+        params = ["Te", "Ne", "hx"]
+
+        def get_field(self, name, itime=-1):
+            raise KeyError("te2d")
+
+    assert not _b2time_has_plasma_2d(FakeSlc())
+    be = SolpsBackend.__new__(SolpsBackend)
+    case = LoadedCase(
+        label="s",
+        case_path="/s",
+        ds=FakeSlc(),
+        is_2d=True,
+        backend_kind="solps",
+        backend=be,
+    )
+    names = be.list_variables(case)
+    assert "Te" in names
+    assert "Ne" in names
+    assert "hx" not in names
+
+
+def test_solps_step_balance_only_b2time_lists_te():
+    from pathlib import Path
+
+    from src.backends.solps import SolpsBackend
+
+    step = Path("/Users/lloyd/Documents/step0_A5e21D1e24spr")
+    if not (step / "balance.nc").is_file():
+        pytest.skip("STEP SOLPS fixture not available")
+    backend = SolpsBackend()
+    case = backend.load(step)
+    assert case.n_time == 1
+    assert not getattr(case.ds, "transient", True)
+    names = backend.list_variables(case)
+    assert "Te" in names
+    assert "Ne" in names
+

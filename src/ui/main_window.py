@@ -92,7 +92,7 @@ class MainWindow(
     SubplotMenusMixin,
 ):
 
-    def __init__(self, *, initial_case_path: Optional[str], spatial_dim: Optional[str]):
+    def __init__(self, *, initial_case_paths: Optional[List[str]] = None, spatial_dim: Optional[str]):
         super().__init__()
 
         ensure_vendored_deps_on_path()
@@ -265,9 +265,12 @@ class MainWindow(
         except Exception:
             pass
 
-        if initial_case_path:
-            self.path_edit.setText(str(initial_case_path))
-            self.load_dataset(replace=True)
+        if initial_case_paths:
+            # Load multiple paths if provided
+            for i, path in enumerate(initial_case_paths):
+                self.path_edit.setText(str(path))
+                # Replace on first path, add for subsequent paths
+                self.load_dataset(replace=(i == 0))
         else:
             self.set_status("Enter a case directory path and click 'Load case'.")
             self.redraw()

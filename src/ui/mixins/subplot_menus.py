@@ -138,6 +138,19 @@ class SubplotMenusMixin:
             info.setEnabled(False)
             m_add.addAction(info)
 
+        # --- Add all variables with matching units ---
+        # Get all vars with same units (regardless of constrain checkbox)
+        matching_units_vars = [
+            v for v in all_vars
+            if v not in excluded and self._get_var_units(v) == primary_units
+        ]
+        if primary_units and matching_units_vars:
+            act_add_all = QAction(f"Add all with units [{primary_units}]", self)
+            act_add_all.triggered.connect(
+                partial(self._add_all_matching_units_to_subplot, matching_units_vars, varname)
+            )
+            menu.addAction(act_add_all)
+
         # --- Show current overlays with option to remove ---
         current_overlays = self._overlay_vars.get(varname, [])
         if current_overlays:
@@ -164,6 +177,19 @@ class SubplotMenusMixin:
             self._overlay_vars[target_var] = []
         if new_var not in self._overlay_vars[target_var]:
             self._overlay_vars[target_var].append(new_var)
+        # Reset y-limits to auto so the subplot rescales to show all variables
+        self._ylim_mode_by_var[target_var] = "auto"
+        self._refresh_var_item(target_var)
+        self._refresh_overlay_button_labels(target_var)
+        self.request_redraw()
+
+    def _add_all_matching_units_to_subplot(self, vars_to_add: List[str], target_var: str) -> None:
+        """Add all variables with matching units to the target variable's subplot."""
+        if target_var not in self._overlay_vars:
+            self._overlay_vars[target_var] = []
+        for new_var in vars_to_add:
+            if new_var not in self._overlay_vars[target_var]:
+                self._overlay_vars[target_var].append(new_var)
         # Reset y-limits to auto so the subplot rescales to show all variables
         self._ylim_mode_by_var[target_var] = "auto"
         self._refresh_var_item(target_var)
@@ -343,6 +369,19 @@ class SubplotMenusMixin:
             info.setEnabled(False)
             m_add.addAction(info)
 
+        # --- Add all variables with matching units ---
+        # Get all vars with same units (regardless of constrain checkbox)
+        matching_units_vars = [
+            v for v in all_vars
+            if v not in excluded and self._get_var_units(v) == primary_units
+        ]
+        if primary_units and matching_units_vars:
+            act_add_all = QAction(f"Add all with units [{primary_units}]", self)
+            act_add_all.triggered.connect(
+                partial(self._add_all_matching_units_to_hist_subplot, matching_units_vars, varname)
+            )
+            menu.addAction(act_add_all)
+
         # --- Show current overlays with option to remove ---
         current_overlays = self._hist_overlay_vars.get(varname, [])
         if current_overlays:
@@ -374,6 +413,15 @@ class SubplotMenusMixin:
             self._hist_overlay_vars[target_var] = []
         if new_var not in self._hist_overlay_vars[target_var]:
             self._hist_overlay_vars[target_var].append(new_var)
+        self.request_time_history_redraw()
+
+    def _add_all_matching_units_to_hist_subplot(self, vars_to_add: List[str], target_var: str) -> None:
+        """Add all variables with matching units to the target variable's time history subplot."""
+        if target_var not in self._hist_overlay_vars:
+            self._hist_overlay_vars[target_var] = []
+        for new_var in vars_to_add:
+            if new_var not in self._hist_overlay_vars[target_var]:
+                self._hist_overlay_vars[target_var].append(new_var)
         self.request_time_history_redraw()
 
     def _remove_overlay_from_hist_subplot(self, overlay_var: str, target_var: str) -> None:

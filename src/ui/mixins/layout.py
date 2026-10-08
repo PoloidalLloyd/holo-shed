@@ -87,7 +87,7 @@ class LayoutMixin:
         self.search_edit.setPlaceholderText("search variables…")
         left_layout.addWidget(self.search_edit)
 
-        left_layout.addWidget(QLabel("Variables (check/double-click to plot; right-click for options)"))
+        left_layout.addWidget(QLabel("Variables (check/double-click to plot)"))
         self.vars_list = QListWidget()
         self.vars_list.setUniformItemSizes(True)
         self.vars_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -190,6 +190,9 @@ class LayoutMixin:
         self.constrain_overlay_units_check = QCheckBox("Constrain subplot overlays by units")
         self.constrain_overlay_units_check.setChecked(True)
         prof_ctrl_layout.addWidget(self.constrain_overlay_units_check)
+        self.show_markers_check = QCheckBox("Show markers on plots (grid points)")
+        self.show_markers_check.setChecked(False)
+        prof_ctrl_layout.addWidget(self.show_markers_check)
         prof_ctrl_layout.addStretch(1)
 
         # Time history controls
@@ -544,6 +547,8 @@ class LayoutMixin:
         self.poly_apply_clim_btn.clicked.connect(self._apply_poly_clim)
         self.guard_replace_check.toggled.connect(lambda _v: self.request_redraw())
         self.guard_replace_check.toggled.connect(lambda _v: self.request_time_history_redraw())
+        self.show_markers_check.toggled.connect(lambda _v: self.request_redraw())
+        self.show_markers_check.toggled.connect(lambda _v: self.request_time_history_redraw())
         self.hist_upstream_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
         self.hist_target_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())
         self.hist_time_slices_spin.valueChanged.connect(lambda _v: self.request_time_history_redraw())

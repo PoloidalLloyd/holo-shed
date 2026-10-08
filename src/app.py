@@ -17,9 +17,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Hermes-3 1D GUI (PyQt + embedded Matplotlib).")
     parser.add_argument(
         "casepath",
-        nargs="?",
+        nargs="*",
         default=None,
-        help="Path to Hermes-3 case directory (contains BOUT.dmp.*.nc and BOUT.inp).",
+        help="Path(s) to Hermes-3 case directory (contains BOUT.dmp.*.nc and BOUT.inp). Multiple paths can be provided to load them all.",
     )
     parser.add_argument(
         "--spatial-dim",
@@ -56,7 +56,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "legend.edgecolor": "#444",
             }
         )
-    win = MainWindow(initial_case_path=args.casepath, spatial_dim=args.spatial_dim)
+    # Convert casepath list to None if empty
+    casepaths = args.casepath if args.casepath else None
+    win = MainWindow(initial_case_paths=casepaths, spatial_dim=args.spatial_dim)
     win.setWindowTitle(f"Hermes-3 GUI - Qt ({_QT_API})")
     win.resize(1400, 850)
     win.show()

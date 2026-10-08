@@ -75,8 +75,26 @@ def redraw_time_history_impl(win):
         n_rows = 2
         gs = win.hist_figure.add_gridspec(nrows=n_rows, ncols=n_cols, hspace=0.35, wspace=0.30)
 
-        # Color cycle for overlays
-        default_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+        # Use same colour scheme as profile plots
+        import matplotlib.pyplot as plt
+        linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+        datasets_by_colour = win._datasets_by_colour()
+
+        # Build variable-to-color map for linestyle mode (same variable = same color across datasets)
+        var_colors = {}
+        if not datasets_by_colour:
+            color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+            # Collect all variables that will be plotted
+            all_vars_to_color = []
+            for var in vars_to_plot:
+                if var not in all_vars_to_color:
+                    all_vars_to_color.append(var)
+                for ov in win._hist_overlay_vars.get(var, []):
+                    if ov not in all_vars_to_color:
+                        all_vars_to_color.append(ov)
+            for vname in all_vars_to_color:
+                if vname not in var_colors:
+                    var_colors[vname] = color_cycle[len(var_colors) % len(color_cycle)]
 
         last_time_ms = None
         for i, var in enumerate(vars_to_plot):
@@ -95,12 +113,18 @@ def redraw_time_history_impl(win):
             log_threshold = 1e6
             max_abs = 0.0
 
+            # Track colors per case for consistent differentiation
+            case_colors = {}
+
+            # Check if markers should be shown
+            show_markers = win.show_markers_check.isChecked() if hasattr(win, 'show_markers_check') else False
+            marker_style = 'o' if show_markers else None
+
             # Plot each variable (primary + overlays)
             for var_idx, plot_var in enumerate(all_vars_for_subplot):
-                color = default_colors[var_idx % len(default_colors)]
                 is_overlay = (var_idx > 0)
 
-                for c in win.cases.values():
+                for case_idx, c in enumerate(win.cases.values()):
                     ds = c.ds
                     if plot_var not in ds:
                         continue
@@ -140,8 +164,9 @@ def redraw_time_history_impl(win):
                     if cached is None:
                         try:
                             t_full = np.asarray(ds[tdim].values) * 1e3
-                            y_up_full = np.asarray(win._isel_1d_with_guard_replace(da, sdim=sdim, idx=upi).values).squeeze()
-                            y_tg_full = np.asarray(win._isel_1d_with_guard_replace(da, sdim=sdim, idx=tgi).values).squeeze()
+                            # atleast_1d: a single-frame dataset squeezes to a 0-d array
+                            y_up_full = np.atleast_1d(np.asarray(win._isel_1d_with_guard_replace(da, sdim=sdim, idx=upi).values).squeeze())
+                            y_tg_full = np.atleast_1d(np.asarray(win._isel_1d_with_guard_replace(da, sdim=sdim, idx=tgi).values).squeeze())
                             win._hist_cache[ck] = (t_full, y_up_full, y_tg_full)
                             cached = win._hist_cache[ck]
                         except Exception:
@@ -185,8 +210,30 @@ def redraw_time_history_impl(win):
                     else:
                         label = c.label if len(win.cases) > 1 else None
 
-                    ax_u.plot(tvals, y_up, "-", linewidth=1.5, label=label, color=color)
-                    ax_t.plot(tvals, y_tg, "--", linewidth=1.5, label=label, color=color)
+                    # Apply consistent color/linestyle scheme matching profile plots
+                    if datasets_by_colour:
+                        # Datasets by colour: each case gets a unique color
+                        if is_overlay:
+                            # Overlays use different linestyle, same color as case
+                            ls_up = linestyles[(var_idx) % len(linestyles)]
+                            ls_tg = linestyles[(var_idx) % len(linestyles)]
+                            color = case_colors.get(c.label)
+                        else:
+                            # Primary variable: solid for upstream, dashed for target
+                            ls_up = "-"
+                            ls_tg = "--"
+                            color = None  # Let matplotlib pick
+                        line_u, = ax_u.plot(tvals, y_up, linestyle=ls_up, linewidth=1.5, label=label, color=color, marker=marker_style, markersize=4)
+                        line_t, = ax_t.plot(tvals, y_tg, linestyle=ls_tg, linewidth=1.5, label=label, color=color, marker=marker_style, markersize=4)
+                        if not is_overlay:
+                            case_colors[c.label] = line_u.get_color()
+                    else:
+                        # Datasets by linestyle: each variable gets same color, different linestyle per case
+                        var_color = var_colors.get(plot_var)
+                        case_ls = linestyles[case_idx % len(linestyles)]
+                        # Use same linestyle for both upstream and target (they're in separate subplots)
+                        ax_u.plot(tvals, y_up, linestyle=case_ls, linewidth=1.5, label=label, color=var_color, marker=marker_style, markersize=4)
+                        ax_t.plot(tvals, y_tg, linestyle=case_ls, linewidth=1.5, label=label, color=var_color, marker=marker_style, markersize=4)
 
                     if tvals.size:
                         last_time_ms = float(tvals[-1])

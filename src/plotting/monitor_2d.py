@@ -180,6 +180,10 @@ def redraw_monitor(win):
     datasets_by_colour = win._datasets_by_colour()
     linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
 
+    # Check if markers should be shown
+    show_markers = win.show_markers_check.isChecked() if hasattr(win, 'show_markers_check') else False
+    marker_style = 'o' if show_markers else None
+
     var_colors: Dict[str, str] = {}
     if not datasets_by_colour:
         import matplotlib.pyplot as plt
@@ -211,6 +215,8 @@ def redraw_monitor(win):
                 plot_kw.update(marker="o", markersize=7, linestyle="None")
             else:
                 plot_kw.update(lw=1.2, linestyle=linestyles[case_idx % len(linestyles)])
+                if marker_style is not None:
+                    plot_kw.update(marker=marker_style, markersize=4)
 
             if datasets_by_colour:
                 a0.plot(t_ms[: len(y0)], y0, **plot_kw)

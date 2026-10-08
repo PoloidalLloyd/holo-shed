@@ -62,6 +62,15 @@ def _is_transient(slc: Any) -> bool:
     return bool(getattr(slc, "transient", False))
 
 
+def _b2time_has_plasma_2d(slc: Any) -> bool:
+    """True when b2time.nc has full-grid te2d/ne2d/ti2d (not just regional tallies)."""
+    bt = getattr(slc, "_b2time", None)
+    if bt is None:
+        return False
+    keys = set(getattr(bt, "variables", {}) or {})
+    return bool(keys & {"te2d", "ne2d", "ti2d"})
+
+
 def _time_kwargs(slc: Any, time_index: int) -> dict:
     if _is_transient(slc):
         return {"itime": int(time_index)}
@@ -117,6 +126,11 @@ class SolpsBackend:
         case_path = str(case_dir)
         label = format_case_label(case_path)
         slc = self._SOLPScase(case_path)
+        # Some SOLPS runs ship b2time.nc with only regional tallies (te3dl,
+        # tesepm, …) and no te2d/ne2d. Those must use balance.nc or every
+        # get_field(itime=-1) call fails and the variable list is empty.
+        if getattr(slc, "transient", False) and not _b2time_has_plasma_2d(slc):
+            slc = self._SOLPScase(case_path, transient=False)
         n_time = self._detect_n_time(slc)
 
         return LoadedCase(
@@ -169,10 +183,13 @@ class SolpsBackend:
             if name in seen:
                 return
             try:
-                if hasattr(slc, "get_field"):
+                arr = None
+                if name in getattr(slc, "bal", {}):
+                    arr = slc.bal[name]
+                elif name in getattr(slc, "g", {}):
+                    arr = slc.g[name]
+                elif hasattr(slc, "get_field"):
                     arr = slc.get_field(name, itime=-1)
-                else:
-                    arr = slc.bal.get(name)
                 if arr is not None and _is_plottable_2d(name, arr):
                     out.append(name)
                     seen.add(name)
